@@ -1,0 +1,20 @@
+{
+  "day": true,
+  "week": true,
+  "month": true,
+  "season": true,
+  "year": false,
+  "60min": true,
+  "30min": false,
+  "15min": false,
+  "5min": false,
+  "use_skip_mode": false,
+  "thread_count": 1,
+  "batch_size": 1000,
+  "auto_save_interval": 3,
+  "auto_save_stock_count": 100,
+  "save_batch_count": 10,
+  "query_sample_count": 1,
+  "enable_data_validation": true,
+  "max_retries": 3
+}
