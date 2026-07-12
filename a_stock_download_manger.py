@@ -52,7 +52,7 @@ class StockDownloader:
         self.min30_db_path = os.path.join(self.db_dir, "minute30_stock_data.duckdb")
         self.min15_db_path = os.path.join(self.db_dir, "minute15_stock_data.duckdb")
         self.min5_db_path = os.path.join(self.db_dir, "minute5_stock_data.duckdb")
-        self.info_db_path = os.path.join(self.db_dir, "stock_info_data.duckdb")
+        self.info_db_path = os.path.join(self.db_dir, "Table.csv")
         
         # 文件路径（全部放到 stock_data\ 下）
         self.table_txt_path = os.path.join(self.data_dir, "table.txt")
@@ -422,68 +422,65 @@ class StockDownloader:
                 self.log_message("数据库连接已关闭", "DEBUG")
     
     def load_ipo_dates_from_info_db(self):
-        """从上市日期数据库加载上市日期"""
+        """从上市日期CSV加载上市日期"""
         try:
             if not os.path.exists(self.info_db_path):
-                self.log_message(f"上市日期数据库不存在: {self.info_db_path}", "WARNING")
+                self.log_message(f"上市日期CSV不存在: {self.info_db_path}", "WARNING")
                 return False
             
             self.log_message(f"正在从 {self.info_db_path} 加载上市日期...")
             
-            try:
-                info_conn = duckdb.connect(self.info_db_path, read_only=True)
-            except Exception as e:
-                self.log_message(f"无法打开上市日期数据库: {e}", "ERROR")
-                return False
-            
-            # 获取表结构
-            tables = info_conn.execute("SHOW TABLES").fetchall()
-            table_names = [t[0] for t in tables]
-            
-            if self.info_table_name not in table_names:
-                self.log_message(f"表 {self.info_table_name} 不存在", "ERROR")
-                info_conn.close()
-                return False
-            
-            # 获取列名
-            columns = info_conn.execute(f"PRAGMA table_info({self.info_table_name})").fetchall()
-            column_names = [col[1] for col in columns]
-            
-            # 查找上市日期字段
+            import csv
             ipo_field = None
-            for name in column_names:
-                name_lower = name.lower()
-                if 'ipo' in name_lower or '上市日期' in name or 'list_date' in name_lower or 'listing' in name_lower:
-                    ipo_field = name
-                    break
-            
-            if not ipo_field:
-                self.log_message("未找到上市日期字段", "WARNING")
-                info_conn.close()
-                return False
-            
-            # 查询上市日期
-            result = info_conn.execute(f"SELECT code, \"{ipo_field}\" FROM {self.info_table_name} WHERE \"{ipo_field}\" IS NOT NULL").fetchall()
-            
-            if not result:
-                self.log_message("没有上市日期记录", "WARNING")
-                info_conn.close()
-                return False
-            
-            # 更新内存缓存
+            row_count = 0
             ipo_count = 0
-            for code, ipo_date in result:
-                if code and ipo_date:
-                    normalized_code = self.normalize_stock_code(str(code))
-                    date_str = str(ipo_date).strip()
-                    if date_str and len(date_str) >= 10:
-                        date_str = date_str[:10]
+            
+            with open(self.info_db_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    self.log_message("CSV文件为空", "WARNING")
+                    return False
+                
+                # 查找上市日期字段
+                for name in header:
+                    name_lower = name.strip().lower()
+                    if 'ipo' in name_lower or '上市日期' in name or 'list_date' in name_lower or 'listing' in name_lower:
+                        ipo_field = name.strip()
+                        break
+                
+                if not ipo_field:
+                    self.log_message("未找到上市日期字段 (需在CSV表头中包含 '上市日期'/'ipo'/'list_date'/'listing')", "WARNING")
+                    return False
+                
+                ipo_col_idx = header.index(ipo_field)
+                
+                # 查找code列
+                code_field = None
+                for name in header:
+                    nl = name.strip().lower()
+                    if nl in ('code', '股票代码', 'stock_code', 'symbol'):
+                        code_field = name.strip()
+                        break
+                if not code_field:
+                    code_field = header[0]  # 默认第一列为代码
+                
+                code_col_idx = header.index(code_field)
+                
+                for row in reader:
+                    row_count += 1
+                    if len(row) <= max(code_col_idx, ipo_col_idx):
+                        continue
+                    code = row[code_col_idx].strip()
+                    date_str = row[ipo_col_idx].strip()
+                    if code and date_str:
+                        normalized_code = self.normalize_stock_code(code)
+                        if len(date_str) >= 10:
+                            date_str = date_str[:10]
                         self.stock_ipo_dates[normalized_code] = date_str
                         ipo_count += 1
             
-            info_conn.close()
-            
-            self.log_message(f"✅ 成功加载 {ipo_count} 只股票的上市日期到内存缓存")
+            self.log_message(f"✅ 成功加载 {ipo_count} 只股票的上市日期到内存缓存 (共解析 {row_count} 行)")
             return True
             
         except Exception as e:
