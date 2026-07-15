@@ -18,6 +18,9 @@ import traceback
 
 # 模块接口导入（剥离GUI的模块）
 from minute60_stock_data_download import run_module as run_60min_module
+from minute30_stock_data_download import run_module as run_30min_module
+from minute15_stock_data_download import run_module as run_15min_module
+from minute5_stock_data_download import run_module as run_5min_module
 from monthly_stock_data_download import run_module as run_monthly_module
 from seasonly_stock_data_download import run_module as run_seasonly_module
 from weekly_stock_data_download import run_module as run_weekly_module
@@ -945,37 +948,34 @@ class StockDownloader:
             self.log_message(f"批量获取最大日期失败: {e}", "ERROR")
             return {code: None for code in codes}
     
-    def get_available_dates_from_baostock(self, stock_code: str, start_date: str, end_date: str) -> List[str]:
+    def get_available_dates_from_baostock(self, stock_code: str, start_date: str, end_date: str,
+                                          frequency: str = "d") -> List[str]:
         """从baostock查询指定股票的可下载日期"""
-        cache_key = (stock_code, start_date, end_date)
-        
+        cache_key = (stock_code, start_date, end_date, frequency)
+
         with self.available_dates_lock:
             if cache_key in self.available_dates_cache:
                 return self.available_dates_cache[cache_key]
-        
+
         try:
-            # 构建baostock代码格式
-            if stock_code.startswith('6'):
+            if stock_code.startswith(('6', '688')):
                 bs_code = f"sh.{stock_code}"
-            elif stock_code.startswith('0') or stock_code.startswith('3'):
+            elif stock_code.startswith(('0', '3')):
                 bs_code = f"sz.{stock_code}"
             else:
                 bs_code = f"sh.{stock_code}"
-            
+
             self.safe_request_delay()
-            
+
             rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="3"
+                bs_code, "date",
+                start_date=start_date, end_date=end_date,
+                frequency=frequency, adjustflag="3"
             )
-            
+
             if rs.error_code != '0':
                 return []
-            
+
             dates = []
             while (rs.error_code == '0') and rs.next():
                 row_data = rs.get_row_data()
@@ -983,52 +983,109 @@ class StockDownloader:
                     date_str = row_data[0].strip()
                     if date_str and len(date_str) >= 10:
                         dates.append(date_str[:10])
-            
+
             with self.available_dates_lock:
                 self.available_dates_cache[cache_key] = dates
-            
+
             return dates
-            
+
         except Exception as e:
             self.log_message(f"查询可下载日期时出错 {stock_code}: {e}", "ERROR")
             return []
-    
-    def get_common_available_dates(self, codes: List[str], start_date: str, end_date: str) -> List[str]:
-        """从多个股票中获取共同的可下载日期"""
-        sample_count = min(self.query_sample_count.get(), len(codes))
-        sample_codes = codes[:sample_count]
-        
-        all_dates_sets = []
-        for code in sample_codes:
-            dates = self.get_available_dates_from_baostock(code, start_date, end_date)
-            if dates:
-                all_dates_sets.append(set(dates))
-        
-        if not all_dates_sets:
-            return []
-        
-        common_dates = set()
-        for dates_set in all_dates_sets:
-            common_dates.update(dates_set)
-        
-        return sorted(list(common_dates))
-    
-    def check_batch_need_update(self, stocks: List[str], end_date: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-        """批量检查股票是否需要更新"""
+
+    def _group_stocks_by_last_date(self, stocks: List[str], end_date: str,
+                                   sample_size: int = 10) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
+        """按最后下载日期分组股票，每组抽样查询baostock可下载日期。
+
+        返回: (groups, no_data_stocks)
+          groups: [(start_date, [codes]), ...] 有可下载数据的批次
+          no_data_stocks: 整组都无数据的股票代码列表
+        """
         max_dates = self.get_stock_max_dates_batch(stocks)
-        
-        need_update = {}
-        all_available_dates = {}
-        
-        stocks_by_start_date = {}
-        
+        MIN_IPO_DATE = "2010-01-01"
+
+        # 按最后下载日期分组
+        groups: Dict[str, List[str]] = {}
+        no_ipo_stocks = []
+        no_db_stocks = []
+
         for code in stocks:
             max_date = max_dates.get(code)
-            
             if max_date is None:
                 ipo_date = self.get_stock_ipo_date(code)
-                start_date = ipo_date if ipo_date else "2000-01-01"
-                stocks_by_start_date.setdefault(start_date, []).append(code)
+                if ipo_date:
+                    start = MIN_IPO_DATE if ipo_date < MIN_IPO_DATE else ipo_date
+                    groups.setdefault(start, []).append(code)
+                else:
+                    no_ipo_stocks.append(code)
+            else:
+                try:
+                    last_dt = datetime.datetime.strptime(max_date, "%Y-%m-%d")
+                    next_day = (last_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    groups.setdefault(next_day, []).append(code)
+                except Exception:
+                    groups.setdefault(max_date, []).append(code)
+
+        # 对每个分组抽样查询
+        all_groups = []
+        all_no_data = []
+
+        for start_date, code_list in groups.items():
+            if not code_list:
+                continue
+
+            sample = code_list[:sample_size] if len(code_list) > sample_size else code_list
+            has_data = False
+            available_dates = []
+
+            for sc in sample:
+                dates = self.get_available_dates_from_baostock(sc, start_date, end_date, "d")
+                if dates:
+                    has_data = True
+                    available_dates.extend(dates)
+
+            if has_data:
+                all_groups.append((start_date, code_list))
+            else:
+                all_no_data.extend(code_list)
+
+        if no_ipo_stocks:
+            all_no_data.extend(no_ipo_stocks)
+
+        return all_groups, all_no_data
+
+    def check_batch_need_update(self, stocks: List[str], end_date: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+        """批量检查股票是否需要更新
+
+        新逻辑：按最后下载日期分组，每组抽样10只查询baostock，
+        有可下载数据则整组下载，无数据则整组跳过。
+        数据库中无数据的股票按上市日期下载。
+        """
+        max_dates = self.get_stock_max_dates_batch(stocks)
+
+        need_update = {}
+        all_available_dates = {}
+
+        stocks_by_start_date = {}
+        skipped_no_ipo = []
+        adjusted_ipo_count = 0
+        MIN_IPO_DATE = "2010-01-01"
+
+        for code in stocks:
+            max_date = max_dates.get(code)
+
+            if max_date is None:
+                ipo_date = self.get_stock_ipo_date(code)
+                if ipo_date:
+                    if ipo_date < MIN_IPO_DATE:
+                        start_date = MIN_IPO_DATE
+                        adjusted_ipo_count += 1
+                    else:
+                        start_date = ipo_date
+                    stocks_by_start_date.setdefault(start_date, []).append(code)
+                else:
+                    skipped_no_ipo.append(code)
+                    continue
             else:
                 if max_date < end_date:
                     try:
@@ -1039,22 +1096,20 @@ class StockDownloader:
                     except Exception as e:
                         self.log_message(f"解析日期失败 {max_date}: {e}", "WARNING")
                         stocks_by_start_date.setdefault(max_date, []).append(code)
-        
+
+        if skipped_no_ipo:
+            self.log_message(f"跳过 {len(skipped_no_ipo)} 只股票：无上市日期记录", "WARNING")
+        if adjusted_ipo_count > 0:
+            self.log_message(f"调整 {adjusted_ipo_count} 只股票的起始日期（原IPO日期早于{MIN_IPO_DATE}）", "INFO")
+
         for start_date, code_list in stocks_by_start_date.items():
             if not code_list:
                 continue
-            
-            available_dates = self.get_common_available_dates(code_list, start_date, end_date)
-            
-            if available_dates:
-                all_available_dates[(start_date, end_date)] = available_dates
-                for code in code_list:
-                    need_update[code] = start_date
-            else:
-                self.log_message(f"开始日期 {start_date} 无可下载数据", "WARNING")
-        
+            for code in code_list:
+                need_update[code] = start_date
+
         return need_update, all_available_dates
-    
+
     def validate_stock_data(self, code: str, data: List[tuple]) -> bool:
         """验证股票数据的完整性和正确性"""
         if not data:
@@ -1283,125 +1338,141 @@ class StockDownloader:
         return code, False, None, True, "超过最大重试次数"
     
     def process_dayly_stocks_single_thread(self, stocks: List[str]):
-        """单线程处理日线数据"""
+        """单线程处理日线数据 - 按最后下载日期分组，抽样查询baostock"""
         skip_mode = "启用" if self.use_skip_mode.get() else "禁用"
         batch_size = self.batch_size_var.get()
         auto_save_stock_count = self.auto_save_stock_count.get()
-        
+
         self.log_message(f"开始单线程处理{len(stocks)}只股票的日线数据... [智能跳过: {skip_mode}]")
         self.log_message(f"[每{auto_save_stock_count}只自动保存]")
-        
+
         self.skip_count = 0
         self.stock_process_count = 0
         self.data_validation_errors = []
         self.stock_retry_count.clear()
         self.missing_stocks.clear()
         self.processed_codes.clear()
-        
+
         if not self.ensure_table_exists():
             self.log_message("无法确保数据表存在，退出下载", "ERROR")
             return
-        
+
         if not self.create_temp_table():
             self.log_message("无法创建临时表，退出下载", "ERROR")
             return
-        
+
         end_date = self.get_previous_trade_day()
         self.log_message(f"本次下载目标日期: {end_date}", "INFO")
-        
-        self.log_message("批量检查股票更新需求...", "INFO")
-        need_update, _ = self.check_batch_need_update(stocks, end_date)
-        
-        stocks_to_download = list(need_update.keys())
-        self.log_message(f"需要更新的股票: {len(stocks_to_download)}/{len(stocks)} 只", "INFO")
-        
-        total_pending = len(stocks_to_download)
+
+        # 按最后下载日期分组，每组抽样10只查询baostock
+        self.log_message("按最后下载日期分组并抽样查询baostock...", "INFO")
+        groups, no_data_stocks = self._group_stocks_by_last_date(stocks, end_date, sample_size=10)
+
+        total_pending = 0
         success_count = 0
         fail_count = 0
         validation_fail_count = 0
         missing_count = 0
-        
-        for idx, code in enumerate(stocks_to_download):
+        skipped_count = 0
+
+        for start_date, code_list in groups:
             if not self.is_running:
                 break
-            
             if self.is_paused:
                 while self.is_paused and self.is_running:
                     time.sleep(0.5)
-            
-            start_date = need_update[code]
-            self.current_stock.set(f"{code} ({idx+1}/{total_pending})")
-            
-            result_code, success, data, is_valid, reason = self.download_single_stock(
-                code, start_date, end_date
-            )
-            
-            if success and data:
-                if is_valid:
-                    self.add_to_buffer(data)
-                    self.save_downloaded_record(code)
-                    success_count += 1
-                    self.processed_codes.add(code)
-                    self.log_message(f"{code} 下载成功 ({len(data)}条)", "INFO")
-                else:
-                    validation_fail_count += 1
-                    self.failed_stocks.append(f"{code}|day|validation_fail")
-                    with open(self.failed_txt_path, 'a', encoding='utf-8') as f:
-                        f.write(f"{code}|day|validation_fail\n")
-                    self.log_message(f"{code} 数据校验失败: {reason}", "WARNING")
-                    self.processed_codes.add(code)
-            else:
-                if reason == "无数据" or reason == "无有效数据":
-                    missing_count += 1
-                    self.missing_stocks.add(code)
-                    self.log_message(f"{code} 无数据，已记录到缺失列表", "WARNING")
-                    self.processed_codes.add(code)
-                else:
-                    fail_count += 1
-                    self.failed_stocks.append(f"{code}|day|{reason}")
-                    with open(self.failed_txt_path, 'a', encoding='utf-8') as f:
-                        f.write(f"{code}|day|{reason}\n")
-                    self.log_message(f"{code} 下载失败: {reason}", "ERROR")
-                    self.processed_codes.add(code)
-            
-            self.processed_stocks = len(self.processed_codes)
-            
-            if self.buffer_size >= batch_size:
-                self.flush_buffer()
-            
-            if self.processed_stocks % auto_save_stock_count == 0 and self.processed_stocks > 0:
-                if not self.is_auto_saving and not self.auto_save_requested:
-                    self.auto_save_requested = True
-                    self.log_message(f"已处理 {self.processed_stocks} 只股票，触发自动保存", "INFO")
-                    self.root.after(0, self.do_auto_save)
-            
-            progress = (self.processed_stocks / total_pending) * 100 if total_pending > 0 else 0
-            self.progress_var.set(progress)
-            
-            elapsed_time = time.time() - self.start_time
-            if elapsed_time > 0:
-                speed = self.processed_stocks / elapsed_time
-                self.speed_label.config(
-                    text=f"速度: {speed:.2f} 只/秒 | 已处理: {self.processed_stocks}/{total_pending} | "
-                         f"缓存: {self.downloaded_rows}行 | 成功: {success_count} | 失败: {fail_count} | "
-                         f"缺失: {missing_count} | 校验失败: {validation_fail_count}"
+
+            self.log_message(f"批次 [{start_date}] 共 {len(code_list)} 只股票，开始下载...", "INFO")
+            batch_success = 0
+            batch_fail = 0
+            batch_missing = 0
+            batch_validation_fail = 0
+
+            for idx, code in enumerate(code_list):
+                if not self.is_running:
+                    break
+                if self.is_paused:
+                    while self.is_paused and self.is_running:
+                        time.sleep(0.5)
+
+                self.current_stock.set(f"{code} ({total_pending + idx + 1})")
+
+                result_code, success, data, is_valid, reason = self.download_single_stock(
+                    code, start_date, end_date
                 )
-        
+
+                if success and data:
+                    if is_valid:
+                        self.add_to_buffer(data)
+                        self.save_downloaded_record(code)
+                        batch_success += 1
+                        success_count += 1
+                        self.processed_codes.add(code)
+                    else:
+                        batch_validation_fail += 1
+                        validation_fail_count += 1
+                        self.failed_stocks.append(f"{code}|day|validation_fail")
+                        with open(self.failed_txt_path, 'a', encoding='utf-8') as f:
+                            f.write(f"{code}|day|validation_fail\n")
+                        self.processed_codes.add(code)
+                else:
+                    if reason in ("无数据", "无有效数据"):
+                        batch_missing += 1
+                        missing_count += 1
+                        self.missing_stocks.add(code)
+                        self.processed_codes.add(code)
+                    else:
+                        batch_fail += 1
+                        fail_count += 1
+                        self.failed_stocks.append(f"{code}|day|{reason}")
+                        with open(self.failed_txt_path, 'a', encoding='utf-8') as f:
+                            f.write(f"{code}|day|{reason}\n")
+                        self.processed_codes.add(code)
+
+                self.processed_stocks = len(self.processed_codes)
+
+                if self.buffer_size >= batch_size:
+                    self.flush_buffer()
+
+                if self.processed_stocks % auto_save_stock_count == 0 and self.processed_stocks > 0:
+                    if not self.is_auto_saving and not self.auto_save_requested:
+                        self.auto_save_requested = True
+                        self.log_message(f"已处理 {self.processed_stocks} 只股票，触发自动保存", "INFO")
+                        self.root.after(0, self.do_auto_save)
+
+            total_pending += len(code_list)
+            self.log_message(
+                f"批次 [{start_date}] 完成: 成功{batch_success} 失败{batch_fail} "
+                f"缺失{batch_missing} 校验失败{batch_validation_fail}", "INFO"
+            )
+
+        # 处理整组无数据的股票（直接跳过）
+        if no_data_stocks:
+            skipped_count = len(no_data_stocks)
+            self.log_message(f"跳过 {skipped_count} 只股票（抽样查询无可用数据）", "INFO")
+            total_pending += skipped_count
+            self.processed_codes.update(no_data_stocks)
+
+        progress = (self.processed_stocks / max(total_pending, 1)) * 100
+        self.progress_var.set(progress)
+
         with self.temp_table_lock:
             self.flush_buffer()
-            
             if self.downloaded_rows > 0:
                 self.merge_temp_to_main(checkpoint=True, batch_save=True)
                 self.recreate_temp_table()
             else:
                 self.log_message("没有新数据需要合并", "INFO")
-        
+
         if fail_count > 0 or validation_fail_count > 0 or missing_count > 0:
-            self.log_message(f"日线处理完成：成功{success_count}只，失败{fail_count}只，"
-                           f"校验失败{validation_fail_count}只，缺失{missing_count}只", "WARNING")
+            self.log_message(
+                f"日线处理完成：成功{success_count}只，失败{fail_count}只，"
+                f"校验失败{validation_fail_count}只，缺失{missing_count}只，跳过{skipped_count}只",
+                "WARNING"
+            )
         else:
             self.log_message(f"日线处理完成：成功{success_count}只", "INFO")
-        
+
         if self.missing_stocks:
             self.log_message(f"缺失股票列表 ({len(self.missing_stocks)}只): {sorted(list(self.missing_stocks))}", "WARNING")
     
@@ -1613,6 +1684,24 @@ class StockDownloader:
                     try:
                         if period == '60min':
                             run_60min_module(
+                                stocks=stocks,
+                                force=False,
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == '30min':
+                            run_30min_module(
+                                stocks=stocks,
+                                force=False,
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == '15min':
+                            run_15min_module(
+                                stocks=stocks,
+                                force=False,
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == '5min':
+                            run_5min_module(
                                 stocks=stocks,
                                 force=False,
                                 log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
