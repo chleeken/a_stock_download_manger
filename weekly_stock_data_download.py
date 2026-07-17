@@ -137,6 +137,27 @@ class WeekConverter:
         if self.log_callback:
             self.log_callback(message)
 
+    def _is_past_5pm(self):
+        return self.current_time.hour >= 17 or (self.current_time.hour == 16 and self.current_time.minute >= 30)
+
+    def is_friday_after_5pm(self):
+        return self.current_time.weekday() == 4 and self._is_past_5pm()
+
+    def is_current_week_data_complete(self, week_conn):
+        try:
+            result = week_conn.execute(f"""
+                SELECT MAX(date) FROM {self.main_table}
+            """).fetchone()
+            max_date = result[0] if result else None
+            if not max_date:
+                return False
+            today = self.current_time.date()
+            days_since_monday = self.current_time.weekday()
+            monday = today - timedelta(days=days_since_monday)
+            return max_date >= monday
+        except Exception:
+            return False
+
     def detect_day_table_structure(self, day_conn):
         self._log("检测日线数据库表结构...")
         try:
@@ -393,6 +414,15 @@ class WeekConverter:
         if not self.day_db.exists():
             self._log(f"日线数据库不存在: {self.day_db}", "error")
             return
+        if not self.is_friday_after_5pm():
+            self._log(f"当前不是周五17:00后，跳过周线转换。当前时间: {self.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            return
+        week_conn_check = duckdb.connect(str(self.week_db))
+        if self.is_current_week_data_complete(week_conn_check):
+            week_conn_check.close()
+            self._log("本周数据已存在，跳过周线转换")
+            return
+        week_conn_check.close()
         self.process_all_stocks()
         self.stats['end_time'] = datetime.now()
         self._log(f"转换完成，耗时 {(self.stats['end_time'] - self.stats['start_time']).total_seconds():.1f}秒")

@@ -12,13 +12,14 @@ import logging
 from pathlib import Path
 from functools import wraps
 import sys
+import random
 import atexit
 
 # ==================== 配置 ====================
 class Config:
     __slots__ = ('max_records', 'tolerance', 'db_dir', 'db_name', 'stock_file',
                  'request_delay', 'retry_times', 'batch_size', 'skip_threshold',
-                 'wal_auto_checkpoint', 'wal_checkpoint_size', 'enable_wal',
+                 'sample_size', 'wal_auto_checkpoint', 'wal_checkpoint_size', 'enable_wal',
                  'market_hours_only', 'no_data_threshold', 'batch_check_size')
 
     def __init__(self):
@@ -31,6 +32,7 @@ class Config:
         self.request_delay = 0.01
         self.retry_times = 2
         self.batch_size = 200
+        self.sample_size = 10
         self.skip_threshold = 500
         self.wal_auto_checkpoint = True
         self.wal_checkpoint_size = 20
@@ -248,6 +250,93 @@ class StockDownloader:
     def _full_code(self, code):
         return f"sh.{code}" if code[0] == '6' else f"sz.{code}"
 
+    def check_downloadable(self, code):
+        """检查股票是否有可下载数据，返回最早可下载日期"""
+        for attempt in range(2):
+            try:
+                c = self.norm(code)
+                if not c:
+                    return None, "无效代码"
+                if not self._check_login():
+                    self._login()
+                full_code = self._full_code(c)
+                today = datetime.datetime.now().strftime("%Y-%m-%d")
+                rs = bs.query_history_k_data_plus(
+                    full_code, "date",
+                    start_date="2005-01-01", end_date=today, frequency="60", adjustflag="2"
+                )
+                if rs.error_code != '0':
+                    if attempt == 0:
+                        self._logout()
+                        time.sleep(1)
+                        self._login()
+                        continue
+                    return None, f"查询失败:{rs.error_msg}"
+                first_date = None
+                count = 0
+                while rs.next():
+                    row = rs.get_row_data()
+                    d = row[0] if row else None
+                    if d:
+                        if first_date is None:
+                            first_date = d
+                        count += 1
+                return first_date, f"有{count}条数据，最早:{first_date}"
+            except Exception as e:
+                if attempt == 0:
+                    self._logout()
+                    time.sleep(1)
+                    continue
+                logger.debug(f"查询可下载数据失败 {code}: {e}")
+                return None, str(e)
+
+    def download_single_stock(self, code, force=False, days=365):
+        """单只股票下载（从table.txt读取的代码格式如SH600000）"""
+        try:
+            c = self.norm(code)
+            if not c:
+                return False, "无效代码"
+            need, reason = self.need_download_fast(c, force)
+            if not need and not force:
+                return True, reason
+            if not self._check_login():
+                self._login()
+            max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
+            now = datetime.datetime.now()
+            if force or max_date is None:
+                sd = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+                ed = now.strftime("%Y-%m-%d")
+            else:
+                sd = (max_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                ed = now.strftime("%Y-%m-%d")
+                if sd > ed:
+                    return True, "已是最新"
+            rs = bs.query_history_k_data_plus(
+                self._full_code(c), "date,time,open,high,low,close,volume,amount",
+                start_date=sd, end_date=ed, frequency="60", adjustflag="2"
+            )
+            if rs.error_code != '0':
+                logger.error(f"{c} 下载失败:{rs.error_msg}")
+                return False, rs.error_msg
+            data_rows = []
+            fields = rs.fields
+            while rs.next():
+                data_rows.append(rs.get_row_data())
+            if not data_rows:
+                return True, "无新数据"
+            processed_data = self.process_stock_data_batch(data_rows, fields, c, max_date if not force else None)
+            if not processed_data:
+                return True, "处理后无新数据"
+            filtered_data = self.filter_time_points_batch(processed_data)
+            if filtered_data:
+                success, save_msg = self.save_single_stock(c, filtered_data)
+                return success, save_msg
+            else:
+                return True, "无有效数据"
+        except Exception as e:
+            logger.error(f"{code} 处理异常:{str(e)}")
+            return False, str(e)
+
     def read_file(self, f=None):
         base_dir = Path(__file__).parent.parent / "stock_data"
         p = Path(f or (base_dir / config.stock_file))
@@ -256,13 +345,22 @@ class StockDownloader:
             return []
         codes = []
         try:
-            with open(p, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        c = self.norm(line)
-                        if c:
-                            codes.append(c)
+            for enc in ('utf-8', 'gbk', 'gb2312', 'gb18030'):
+                try:
+                    with open(p, 'r', encoding=enc) as f:
+                        lines = f.readlines()
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                logger.error(f"无法解码文件:{p}")
+                return []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    c = self.norm(line)
+                    if c:
+                        codes.append(c)
             logger.info(f"从文件读取{len(codes)}只股票: {p}")
             self._all_stocks_list = codes
             return codes
@@ -453,6 +551,208 @@ class StockDownloader:
             logger.error(f"{code} 保存失败:{e}")
             return False, str(e)
 
+    def cleanup_excess_records(self, code):
+        """删除超过max_records的最旧记录（异步后台清理）"""
+        try:
+            c = self.norm(code)
+            current_count = self.con.execute(
+                "SELECT COUNT(*) FROM minute60_data WHERE code=?", [c]
+            ).fetchone()[0]
+            if current_count > config.max_records:
+                to_delete = current_count - config.max_records
+                self.con.execute("""
+                    DELETE FROM minute60_data WHERE code=? AND date_time IN (
+                        SELECT date_time FROM minute60_data WHERE code=? ORDER BY date_time ASC LIMIT ?
+                    )
+                """, [c, c, to_delete])
+                logger.info(f"{c} 清理{to_delete}条旧数据，当前{current_count - to_delete}条")
+        except Exception as e:
+            logger.error(f"{code} 清理失败: {e}")
+
+    def get_available_dates_sample(self, code, start_date, end_date):
+        """抽样查询某只股票在指定日期范围内是否有可下载数据，返回最早可下载日期"""
+        try:
+            rs = bs.query_history_k_data_plus(
+                self._full_code(code), "date",
+                start_date=start_date, end_date=end_date, frequency="60", adjustflag="2"
+            )
+            if rs.error_code != '0':
+                return None
+            first_date = None
+            while rs.next():
+                row = rs.get_row_data()
+                d = row[0] if row else None
+                if d and first_date is None:
+                    first_date = d
+                    break
+            return first_date
+        except Exception as e:
+            logger.debug(f"抽样查询失败 {code}: {e}")
+            return None
+
+    def get_stock_list_info(self, code):
+        """获取股票基本信息（上市日期等）"""
+        try:
+            rs = bs.query_stock_basic(code=self._full_code(code))
+            if rs.error_code != '0':
+                return None
+            while rs.next():
+                row = rs.get_row_data()
+                fields = list(rs.fields)
+                result = dict(zip(fields, row))
+                return result
+        except Exception as e:
+            logger.debug(f"查询股票信息失败 {code}: {e}")
+        return None
+
+    def _download_range(self, code, start_date, end_date, force=False):
+        """按指定日期范围下载并处理数据"""
+        try:
+            c = self.norm(code)
+            if not c:
+                return None, "无效代码"
+            if not self._check_login():
+                self._login()
+            max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
+            rs = bs.query_history_k_data_plus(
+                self._full_code(c), "date,time,open,high,low,close,volume,amount",
+                start_date=start_date, end_date=end_date, frequency="60", adjustflag="2"
+            )
+            if rs.error_code != '0':
+                logger.error(f"{c} 下载失败:{rs.error_msg}")
+                return None, rs.error_msg
+            data_rows = []
+            fields = rs.fields
+            while rs.next():
+                data_rows.append(rs.get_row_data())
+            if not data_rows:
+                return None, "无新数据"
+            processed_data = self.process_stock_data_batch(data_rows, fields, c, max_date if not force else None)
+            if not processed_data:
+                return None, "处理后无新数据"
+            filtered_data = self.filter_time_points_batch(processed_data)
+            if filtered_data:
+                return filtered_data, "成功"
+            else:
+                return None, "无有效数据"
+        except Exception as e:
+            logger.error(f"{code} 处理异常:{str(e)}")
+            return None, str(e)
+
+    def _group_stocks_by_last_date(self, download_list):
+        """按最后下载日期分组股票，返回 {(last_date_str|'new'): [codes]}"""
+        groups = {}
+        for code in download_list:
+            info = self._stock_cache.get(code)
+            if info is None:
+                groups.setdefault('new', []).append(code)
+            else:
+                last_d = info['max_date']
+                key = last_d.strftime('%Y-%m-%d') if last_d else 'new'
+                groups.setdefault(key, []).append(code)
+        return groups
+
+    def download_group_by_sample(self, group_key, group_codes, log_callback=None, progress=None, total_processed=0):
+        """对同一最后下载日期的股票组，通过抽样决定是否批量下载"""
+        result = {'s': 0, 'k': 0, 'f': 0}
+
+        if log_callback:
+            log_callback(f"[日期组:{group_key}] 共{len(group_codes)}只股票")
+
+        if group_key == 'new':
+            # 无数据的股票：从上市日期开始下载
+            for code in group_codes:
+                total_processed += 1
+                if progress:
+                    progress(total_processed, len(self._all_stocks_list), code, "新股上市起下载")
+
+                stock_info = self.get_stock_list_info(code)
+                if stock_info and 'startDateTime' in stock_info:
+                    sd = stock_info['startDateTime'][:10]
+                else:
+                    sd = "2005-01-01"
+                ed = datetime.datetime.now().strftime("%Y-%m-%d")
+
+                data, msg = self._download_range(code, sd, ed, force=True)
+                if data:
+                    success, save_msg = self.save_single_stock(code, data)
+                    if success:
+                        result['s'] += 1
+                        if log_callback:
+                            log_callback(f"  {code}: {save_msg}")
+                    else:
+                        result['f'] += 1
+                else:
+                    result['k'] += 1
+                time.sleep(config.request_delay)
+
+            return result, total_processed
+
+        # 有最后下载日期的组：抽样10只查询
+        sample = random.sample(group_codes, min(config.sample_size, len(group_codes)))
+        if log_callback:
+            log_callback(f"  抽样{len(sample)}只查询可下载日期")
+
+        # 查询抽样股票的可下载日期
+        earliest_available = None
+        has_data = False
+        for sc in sample:
+            info = self._stock_cache.get(sc, {})
+            last_d = info.get('max_date')
+            if not last_d:
+                continue
+            next_d = (last_d + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            ed = datetime.datetime.now().strftime("%Y-%m-%d")
+            if next_d > ed:
+                continue
+            avail = self.get_available_dates_sample(sc, next_d, ed)
+            if avail:
+                has_data = True
+                if earliest_available is None or avail < earliest_available:
+                    earliest_available = avail
+            time.sleep(config.request_delay * 2)
+
+        if not has_data:
+            if log_callback:
+                log_callback(f"  抽样均无可下载数据，跳过本组({len(group_codes)}只)")
+            result['k'] = len(group_codes)
+            return result, total_processed
+
+        if log_callback:
+            log_callback(f"  抽样有数据，最早可下载:{earliest_available}，开始全组下载")
+
+        # 全组按可下载日期批量下载
+        for code in group_codes:
+            total_processed += 1
+            if progress:
+                progress(total_processed, len(self._all_stocks_list), code, "日期组下载")
+
+            info = self._stock_cache.get(code, {})
+            last_d = info.get('max_date')
+            if last_d:
+                sd = earliest_available
+                ed = datetime.datetime.now().strftime("%Y-%m-%d")
+            else:
+                stock_info = self.get_stock_list_info(code)
+                sd = stock_info['startDateTime'][:10] if stock_info and 'startDateTime' in stock_info else "2005-01-01"
+                ed = datetime.datetime.now().strftime("%Y-%m-%d")
+
+            data, msg = self._download_range(code, sd, ed, force=False)
+            if data:
+                success, save_msg = self.save_single_stock(code, data)
+                if success:
+                    self.cleanup_excess_records(code)
+                    result['s'] += 1
+                    if log_callback:
+                        log_callback(f"  {code}: {save_msg}")
+                else:
+                    result['f'] += 1
+            else:
+                result['k'] += 1
+            time.sleep(config.request_delay)
+
+        return result, total_processed
+
     def download_stock(self, code, force=False, days=365):
         try:
             c = self.norm(code)
@@ -516,67 +816,31 @@ class StockDownloader:
             download_list = self._all_stocks_list
             logger.info(f"强制下载全部: {len(download_list)}只")
 
-        res = {'t': len(self._all_stocks_list), 's': 0, 'k': len(self._all_stocks_list) - len(download_list), 'f': 0}
-
         if not download_list:
             if log_callback:
                 log_callback("所有股票都已是最新，无需下载")
             if progress:
                 progress(0, 0, "", "完成 (无需下载)")
-            return res
-
-        is_trading = self.is_trading_time()
-        has_today_data = self.check_market_has_today_data() if is_trading else False
+            return {'t': len(self._all_stocks_list), 's': 0, 'k': 0, 'f': 0}
 
         if log_callback:
             log_callback(f"开始下载任务: 需下载{len(download_list)}只")
 
-        batch_size = config.batch_size
-        total_batches = (len(download_list) + batch_size - 1) // batch_size
+        # 按最后下载日期分组
+        groups = self._group_stocks_by_last_date(download_list)
+        if log_callback:
+            log_callback(f"按最后下载日期分为{len(groups)}组")
 
-        for batch_idx in range(total_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(download_list))
-            batch_codes = download_list[start_idx:end_idx]
+        res = {'t': len(download_list), 's': 0, 'k': 0, 'f': 0}
+        total_processed = 0
 
-            if log_callback:
-                log_callback(f"处理第{batch_idx + 1}/{total_batches}批, {len(batch_codes)}只股票")
-
-            if progress:
-                progress(start_idx, len(download_list), "", f"批{batch_idx + 1}/{total_batches}")
-
-            batch_success = 0
-            batch_skip = 0
-            batch_fail = 0
-
-            for code in batch_codes:
-                try:
-                    data, msg = self.download_stock(code, force)
-                    if data is None:
-                        if "无新数据" in msg:
-                            batch_skip += 1
-                        else:
-                            batch_fail += 1
-                    else:
-                        success, save_msg = self.save_single_stock(code, data)
-                        if success:
-                            batch_success += 1
-                            if log_callback:
-                                log_callback(f"{code}: {save_msg}")
-                        else:
-                            batch_fail += 1
-                    time.sleep(config.request_delay)
-                except Exception as e:
-                    logger.error(f"{code} 处理异常:{str(e)}")
-                    batch_fail += 1
-
-            res['s'] += batch_success
-            res['k'] += batch_skip
-            res['f'] += batch_fail
-
-            if progress:
-                progress(end_idx, len(download_list), "",
-                        f"批{batch_idx + 1}/{total_batches} 成功:{batch_success} 跳过:{batch_skip} 失败:{batch_fail}")
+        for group_key, group_codes in sorted(groups.items()):
+            group_res, total_processed = self.download_group_by_sample(
+                group_key, group_codes, log_callback, progress, total_processed
+            )
+            res['s'] += group_res['s']
+            res['k'] += group_res['k']
+            res['f'] += group_res['f']
 
             if config.wal_auto_checkpoint:
                 self.wal_manager.checkpoint(self.con)

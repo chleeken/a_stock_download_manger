@@ -104,6 +104,58 @@ class DataConverter:
         self.processed_count = 0
         self.continuous_skip = 0
         self.start_time = None
+        self.current_time = datetime.now()
+
+    @staticmethod
+    def _is_past_5pm(dt):
+        return dt.hour >= 17 or (dt.hour == 16 and dt.minute >= 30)
+
+    def is_last_trading_day_of_quarter(self):
+        today = self.current_time.date()
+        if today.day == 1:
+            return False
+        month = today.month
+        if month in [1, 2, 3]:
+            quarter_end_months = [3]
+        elif month in [4, 5, 6]:
+            quarter_end_months = [6]
+        elif month in [7, 8, 9]:
+            quarter_end_months = [9]
+        else:
+            quarter_end_months = [12]
+        last_month = quarter_end_months[0]
+        import calendar
+        try:
+            last_day = calendar.monthrange(today.year, last_month)[1]
+        except Exception:
+            last_day = 28
+        last_day_date = today.replace(month=last_month, day=last_day)
+        if today != last_day_date:
+            return False
+        return self._is_past_5pm(self.current_time)
+
+    def has_current_quarter_data(self, seasonly_db_path):
+        import duckdb
+        try:
+            conn = duckdb.connect(str(seasonly_db_path))
+            result = conn.execute("SELECT MAX(date) FROM seasonly_stock_data").fetchone()
+            conn.close()
+            max_date = result[0] if result else None
+            if not max_date:
+                return False
+            today = self.current_time.date()
+            month = today.month
+            if month <= 3:
+                q_start = today.replace(month=1, day=1)
+            elif month <= 6:
+                q_start = today.replace(month=4, day=1)
+            elif month <= 9:
+                q_start = today.replace(month=7, day=1)
+            else:
+                q_start = today.replace(month=10, day=1)
+            return max_date >= q_start
+        except Exception:
+            return False
 
     def pause(self):
         self.paused = True
@@ -371,6 +423,16 @@ def run_module(use_index=True, skip_optimize=True, progress_callback=None, log_c
     """被主程序调用的模块入口"""
     if log_callback:
         log_callback("开始季线数据转换...")
+
+    converter = DataConverter(None, progress_callback)
+    if not converter.is_last_trading_day_of_quarter():
+        if log_callback:
+            log_callback(f"当前不是季度末最后交易日17:00后，跳过季线转换。当前时间: {converter.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        return None
+    if converter.has_current_quarter_data(SEASONLY_DB_PATH):
+        if log_callback:
+            log_callback("本季度数据已存在，跳过季线转换")
+        return None
 
     db_manager = DatabaseManager()
     converter = DataConverter(db_manager, progress_callback)

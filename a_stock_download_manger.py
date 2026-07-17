@@ -40,11 +40,12 @@ class StockDownloader:
         self.program_dir = self.get_program_dir()
         self.work_dir = self.get_work_dir()
         
-        # 数据目录：与程序目录同级，stock_data\
-        self.data_dir = os.path.join(os.path.dirname(self.program_dir), "stock_data")
+        # 数据目录：程序同级目录 stock_data
+        parent_dir = os.path.dirname(self.program_dir)
+        self.data_dir = os.path.join(parent_dir, 'stock_data')
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # 数据库路径（直接指定）
+        # 数据库路径（全部在程序目录下）
         self.db_dir = self.data_dir
         self.day_db_path = os.path.join(self.db_dir, "stock_data.duckdb")
         self.week_db_path = os.path.join(self.db_dir, "weekly_stock_data.duckdb")
@@ -57,7 +58,7 @@ class StockDownloader:
         self.min5_db_path = os.path.join(self.db_dir, "minute5_stock_data.duckdb")
         self.info_db_path = os.path.join(self.db_dir, "Table.csv")
         
-        # 文件路径（全部放到 stock_data\ 下）
+        # 文件路径（全部在程序目录下）
         self.table_txt_path = os.path.join(self.data_dir, "table.txt")
         self.failed_txt_path = os.path.join(self.data_dir, "failed_stocks.txt")
         self.config_file = os.path.join(self.data_dir, "stock_get_date_config.json")
@@ -68,12 +69,6 @@ class StockDownloader:
         # 表名配置
         self.day_table_name = "dayly_stock_data"
         self.info_table_name = "stock_data"
-        
-        # 文件路径
-        self.table_txt_path = os.path.join(self.work_dir, "table.txt")
-        self.failed_txt_path = os.path.join(self.work_dir, "failed_stocks.txt")
-        self.config_file = os.path.join(self.work_dir, "stock_get_date_config.json")
-        self.downloaded_record_file = os.path.join(self.work_dir, "downloaded_stocks.json")
         
         # 变量初始化
         self.is_running = False
@@ -1431,6 +1426,14 @@ class StockDownloader:
 
                 self.processed_stocks = len(self.processed_codes)
 
+                # 更新进度条和速度标签
+                elapsed = time.time() - self.start_time if self.start_time > 0 else 1
+                speed = self.processed_stocks / elapsed if elapsed > 0 else 0
+                total = max(total_pending, len(stocks))
+                self.progress_var.set((self.processed_stocks / total) * 100 if total > 0 else 0)
+                self.root.after(0, lambda s=speed, p=self.processed_stocks, t=total, b=self.buffer_size: 
+                    self.speed_label.config(text=f"速度: {s:.1f} 只/秒 | 已处理: {p}/{t} | 缓存: {b}行"))
+
                 if self.buffer_size >= batch_size:
                     self.flush_buffer()
 
@@ -2446,11 +2449,11 @@ class StockDownloader:
             else:
                 failed_stocks.append(item)
         failed_stocks = list(set(failed_stocks))
-        temp_file = os.path.join(self.work_dir, 'table_temp.txt')
+        temp_file = os.path.join(self.data_dir, 'table_temp.txt')
         with open(temp_file, 'w', encoding='utf-8') as f:
             for stock in failed_stocks:
                 f.write(f"{stock}\n")
-        backup_file = os.path.join(self.work_dir, 'table_backup.txt')
+        backup_file = os.path.join(self.data_dir, 'table_backup.txt')
         if os.path.exists(self.table_txt_path):
             os.rename(self.table_txt_path, backup_file)
         os.rename(temp_file, self.table_txt_path)

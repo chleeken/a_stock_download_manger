@@ -245,6 +245,36 @@ class DataProcessor:
         }
         self.stop_flag = False
         self.pause_flag = False
+        self.current_time = datetime.now()
+
+    @staticmethod
+    def _is_past_5pm(dt):
+        return dt.hour >= 17 or (dt.hour == 16 and dt.minute >= 30)
+
+    def is_last_trading_day_of_month(self):
+        today = self.current_time.date()
+        if today.day == 1:
+            return False
+        next_month = today.replace(day=28) + timedelta(days=4)
+        last_day = next_month.replace(day=1) - timedelta(days=1)
+        if today != last_day:
+            return False
+        return self._is_past_5pm(self.current_time)
+
+    def has_current_month_data(self, monthly_db_path: Path) -> bool:
+        import duckdb
+        try:
+            conn = duckdb.connect(str(monthly_db_path))
+            result = conn.execute("SELECT MAX(date) FROM monthly_data").fetchone()
+            conn.close()
+            max_date = result[0] if result else None
+            if not max_date:
+                return False
+            today = self.current_time.date()
+            month_start = today.replace(day=1)
+            return max_date >= month_start
+        except Exception:
+            return False
 
     @staticmethod
     def daily_to_monthly(daily_data: List[Dict]) -> List[Dict]:
@@ -396,6 +426,16 @@ class DataProcessor:
 # ==================== 模块接口 ====================
 def run_module(skip_optimization=True, progress_callback=None, log_callback=None):
     """被主程序调用的模块入口"""
+    processor = DataProcessor(None)
+    if not processor.is_last_trading_day_of_month():
+        if log_callback:
+            log_callback(f"当前不是月底最后交易日17:00后，跳过月线转换。当前时间: {processor.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        return None
+    if processor.has_current_month_data(Config.MONTHLY_DB_PATH):
+        if log_callback:
+            log_callback("本月数据已存在，跳过月线转换")
+        return None
+
     db_manager = DatabaseManager(Config.DAILY_DB_PATH, Config.MONTHLY_DB_PATH)
     if not db_manager.connect():
         if log_callback:
