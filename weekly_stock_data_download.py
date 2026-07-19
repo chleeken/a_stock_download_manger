@@ -1,16 +1,15 @@
 """
 日线转周线数据转换器（模块化，无GUI依赖）
-作为模块被 a_stock_download_manger.py 调用
 """
 import duckdb
+import logging
 import sys
 import time
 import re
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple, Callable
-import logging
+from typing import List, Dict, Optional, Callable
 
 
 # ==================== 日志 ====================
@@ -25,20 +24,6 @@ logger.propagate = False
 
 
 class PathManager:
-    """路径管理器 - 处理打包后的路径问题"""
-    @staticmethod
-    def get_program_dir() -> Path:
-        if getattr(sys, 'frozen', False):
-            return Path(sys.executable).parent
-        else:
-            return Path(__file__).parent
-
-    @staticmethod
-    def is_temp_directory(path: Path) -> bool:
-        path_str = str(path).lower()
-        temp_indicators = ['temp', 'tmp', 'cache', '_mei', 'appdata\\local\\temp']
-        return any(indicator in path_str for indicator in temp_indicators)
-
     @staticmethod
     def get_program_dir() -> Path:
         if getattr(sys, 'frozen', False):
@@ -48,48 +33,12 @@ class PathManager:
 
     @staticmethod
     def get_data_dir() -> Path:
-        """数据目录：与程序目录同级，stock_data\\"""
         data_dir = PathManager.get_program_dir().parent / "stock_data"
         data_dir.mkdir(parents=True, exist_ok=True)
         return data_dir
 
-    @staticmethod
-    def get_work_dir() -> Path:
-        # 优先使用数据目录
-        return PathManager.get_data_dir()
-
-    @staticmethod
-    def get_config_dir() -> Path:
-        config_dir = PathManager.get_work_dir() / "stock_converter_config"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        return config_dir
-
-    @staticmethod
-    def get_last_opened_path() -> Optional[Path]:
-        config_file = PathManager.get_config_dir() / "last_path.json"
-        if config_file.exists():
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    last_path = Path(data.get('last_path', ''))
-                    if last_path.exists():
-                        return last_path
-            except:
-                pass
-        return None
-
-    @staticmethod
-    def save_last_opened_path(path: Path):
-        config_file = PathManager.get_config_dir() / "last_path.json"
-        try:
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump({'last_path': str(path)}, f, ensure_ascii=False, indent=2)
-        except:
-            pass
-
 
 class WeekConverter:
-    """日线转周线转换器 - 优化版本"""
     def __init__(self, day_db_path: Optional[Path] = None,
                  week_db_path: Optional[Path] = None,
                  progress_callback: Optional[Callable] = None,
@@ -110,7 +59,6 @@ class WeekConverter:
 
         self.main_table = "weekly_data"
         self.current_time = datetime.now()
-        self.user_cancelled = False
 
         self.day_table_name = None
         self.code_column = None
@@ -136,12 +84,6 @@ class WeekConverter:
         logger.info(message)
         if self.log_callback:
             self.log_callback(message)
-
-    def _is_past_5pm(self):
-        return self.current_time.hour >= 17 or (self.current_time.hour == 16 and self.current_time.minute >= 30)
-
-    def is_friday_after_5pm(self):
-        return self.current_time.weekday() == 4 and self._is_past_5pm()
 
     def is_current_week_data_complete(self, week_conn):
         try:
@@ -268,7 +210,7 @@ class WeekConverter:
             self._log(f"获取股票代码失败: {e}", "error")
             return []
 
-    def should_process_stock(self, day_conn, week_conn, stock_code: str) -> Tuple[bool, Optional[datetime.date]]:
+    def should_process_stock(self, day_conn, week_conn, stock_code: str) -> tuple:
         week_max_date = self.get_week_max_date(week_conn, stock_code)
         day_max_date = self.get_day_max_date(day_conn, stock_code)
         if not day_max_date:
@@ -379,9 +321,6 @@ class WeekConverter:
             self._log(f"总共需要处理 {total_stocks} 个股票")
 
             for idx, stock_code in enumerate(stock_codes, 1):
-                if self.user_cancelled:
-                    self._log("用户取消操作，停止处理")
-                    break
                 if self.progress_callback:
                     self.progress_callback(idx, total_stocks, f"处理股票 {stock_code}")
                 self.process_stock(day_conn, week_conn, stock_code)
@@ -414,9 +353,7 @@ class WeekConverter:
         if not self.day_db.exists():
             self._log(f"日线数据库不存在: {self.day_db}", "error")
             return
-        if not self.is_friday_after_5pm():
-            self._log(f"当前不是周五17:00后，跳过周线转换。当前时间: {self.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            return
+
         week_conn_check = duckdb.connect(str(self.week_db))
         if self.is_current_week_data_complete(week_conn_check):
             week_conn_check.close()

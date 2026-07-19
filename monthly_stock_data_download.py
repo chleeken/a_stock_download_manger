@@ -12,22 +12,6 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
-# ==================== 配置模块 ====================
-class Config:
-    """配置类，管理所有路径和常量"""
-    BASE_DIR = Path(__file__).parent
-    # 数据目录：与程序目录同级
-    STOCK_DATA_DIR = BASE_DIR.parent / 'stock_data'
-    DAILY_DB_PATH = STOCK_DATA_DIR / 'stock_data.duckdb'
-    MONTHLY_DB_PATH = STOCK_DATA_DIR / 'monthly_stock_data.duckdb'
-    BATCH_SIZE = 100
-    AUTO_SKIP_THRESHOLD = 50
-    MAX_RETRIES = 3
-    DAILY_TABLE = 'dayly_stock_data'
-    DAILY_INDEX_TABLE = 'dayly_last_download_time'
-    MONTHLY_TABLE = 'monthly_data'
-    MONTHLY_INDEX_TABLE = 'monthly_last_download_time'
-
 
 # ==================== 日志 ====================
 logger = logging.getLogger('stock_monthly')
@@ -40,9 +24,20 @@ logger.addHandler(console_handler)
 logger.propagate = False
 
 
-# ==================== 数据库模块 ====================
+class Config:
+    """配置类，管理所有路径和常量"""
+    BASE_DIR = Path(__file__).parent
+    STOCK_DATA_DIR = BASE_DIR.parent / 'stock_data'
+    DAILY_DB_PATH = STOCK_DATA_DIR / 'stock_data.duckdb'
+    MONTHLY_DB_PATH = STOCK_DATA_DIR / 'monthly_stock_data.duckdb'
+    BATCH_SIZE = 100
+    AUTO_SKIP_THRESHOLD = 50
+    MAX_RETRIES = 3
+    DAILY_TABLE = 'dayly_stock_data'
+    MONTHLY_TABLE = 'monthly_data'
+
+
 class DatabaseManager:
-    """数据库管理类，处理所有数据库操作"""
     def __init__(self, daily_db_path: Path, monthly_db_path: Path):
         self.daily_db_path = daily_db_path
         self.monthly_db_path = monthly_db_path
@@ -52,7 +47,6 @@ class DatabaseManager:
         self.date_column_names = ['date', 'trade_date', 'datetime', 'time', 'day']
 
     def connect(self):
-        """建立数据库连接"""
         try:
             self.daily_db_path.parent.mkdir(parents=True, exist_ok=True)
             self.monthly_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +135,7 @@ class DatabaseManager:
             code_col = self.detect_column_name(self.code_column_names, columns)
             date_col = self.detect_column_name(self.date_column_names, columns)
             if not code_col or not date_col:
-                logger.error(f"无法识别必要的列名")
+                logger.error("无法识别必要的列名")
                 return []
             query = f"""
                 SELECT {code_col} as code, {date_col} as date,
@@ -234,9 +228,7 @@ class DatabaseManager:
             return False
 
 
-# ==================== 数据处理模块 ====================
 class DataProcessor:
-    """数据处理类，负责日线转月线的核心逻辑"""
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
         self.stats = {
@@ -247,22 +239,7 @@ class DataProcessor:
         self.pause_flag = False
         self.current_time = datetime.now()
 
-    @staticmethod
-    def _is_past_5pm(dt):
-        return dt.hour >= 17 or (dt.hour == 16 and dt.minute >= 30)
-
-    def is_last_trading_day_of_month(self):
-        today = self.current_time.date()
-        if today.day == 1:
-            return False
-        next_month = today.replace(day=28) + timedelta(days=4)
-        last_day = next_month.replace(day=1) - timedelta(days=1)
-        if today != last_day:
-            return False
-        return self._is_past_5pm(self.current_time)
-
     def has_current_month_data(self, monthly_db_path: Path) -> bool:
-        import duckdb
         try:
             conn = duckdb.connect(str(monthly_db_path))
             result = conn.execute("SELECT MAX(date) FROM monthly_data").fetchone()
@@ -392,14 +369,14 @@ class DataProcessor:
                     if count > 0:
                         self.stats['processed'] += 1
                         if log_callback:
-                            log_callback(f"✓ {code}: 转换成功，生成{count}条月线记录")
+                            log_callback(f"\u2713 {code}: 转换成功，生成{count}条月线记录")
                         batch_updates.append((code, date.today()))
                     else:
                         self.stats['skipped'] += 1
                 else:
                     self.stats['failed'] += 1
                     if log_callback:
-                        log_callback(f"✗ {code}: 转换失败")
+                        log_callback(f"\u2717 {code}: 转换失败")
             else:
                 self.stats['skipped'] += 1
 
@@ -427,10 +404,7 @@ class DataProcessor:
 def run_module(skip_optimization=True, progress_callback=None, log_callback=None):
     """被主程序调用的模块入口"""
     processor = DataProcessor(None)
-    if not processor.is_last_trading_day_of_month():
-        if log_callback:
-            log_callback(f"当前不是月底最后交易日17:00后，跳过月线转换。当前时间: {processor.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        return None
+
     if processor.has_current_month_data(Config.MONTHLY_DB_PATH):
         if log_callback:
             log_callback("本月数据已存在，跳过月线转换")

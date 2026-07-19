@@ -14,6 +14,7 @@ from functools import wraps
 import gc
 from contextlib import contextmanager
 
+
 # ==================== 日志 ====================
 logger = logging.getLogger('stock_seasonly')
 logger.setLevel(logging.INFO)
@@ -24,21 +25,17 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.propagate = False
 
-# 常量定义
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
-# 数据目录：与程序目录同级
-STOCK_DATA_DIR = os.path.join(PROGRAM_DIR, "..", "stock_data")
-STOCK_DATA_DIR = os.path.normpath(STOCK_DATA_DIR)
+STOCK_DATA_DIR = os.path.normpath(os.path.join(PROGRAM_DIR, "..", "stock_data"))
 DAILY_DB_PATH = os.path.join(STOCK_DATA_DIR, "stock_data.duckdb")
 SEASONLY_DB_PATH = os.path.join(STOCK_DATA_DIR, "seasonly_data.duckdb")
-BATCH_SIZE = 50
+SAVE_INTERVAL = 200
 MAX_SKIP_CONTINUOUS = 50
 
 os.makedirs(STOCK_DATA_DIR, exist_ok=True)
 
 
 def handle_errors(func):
-    """错误处理装饰器"""
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
@@ -50,7 +47,6 @@ def handle_errors(func):
 
 
 class DatabaseManager:
-    """数据库连接管理器"""
     def __init__(self):
         self.daily_conn = None
         self.seasonly_conn = None
@@ -94,7 +90,6 @@ class DatabaseManager:
 
 
 class DataConverter:
-    """数据转换核心类（纯DuckDB实现）"""
     def __init__(self, db_manager, progress_callback=None):
         self.db_manager = db_manager
         self.progress_callback = progress_callback
@@ -106,36 +101,7 @@ class DataConverter:
         self.start_time = None
         self.current_time = datetime.now()
 
-    @staticmethod
-    def _is_past_5pm(dt):
-        return dt.hour >= 17 or (dt.hour == 16 and dt.minute >= 30)
-
-    def is_last_trading_day_of_quarter(self):
-        today = self.current_time.date()
-        if today.day == 1:
-            return False
-        month = today.month
-        if month in [1, 2, 3]:
-            quarter_end_months = [3]
-        elif month in [4, 5, 6]:
-            quarter_end_months = [6]
-        elif month in [7, 8, 9]:
-            quarter_end_months = [9]
-        else:
-            quarter_end_months = [12]
-        last_month = quarter_end_months[0]
-        import calendar
-        try:
-            last_day = calendar.monthrange(today.year, last_month)[1]
-        except Exception:
-            last_day = 28
-        last_day_date = today.replace(month=last_month, day=last_day)
-        if today != last_day_date:
-            return False
-        return self._is_past_5pm(self.current_time)
-
     def has_current_quarter_data(self, seasonly_db_path):
-        import duckdb
         try:
             conn = duckdb.connect(str(seasonly_db_path))
             result = conn.execute("SELECT MAX(date) FROM seasonly_stock_data").fetchone()
@@ -344,7 +310,7 @@ class DataConverter:
         self.skipped_count = 0
         self.processed_count = 0
         self.continuous_skip = 0
-        self.start_time = time.time()
+        self.start_time = None
 
         try:
             with self.db_manager.daily_connection() as daily_conn:
@@ -373,7 +339,14 @@ class DataConverter:
                     return
 
                 if log_callback:
-                    log_callback(f"开始处理 {total_stocks} 只股票（共 {len(all_stocks)} 只）")
+                    log_callback(f"=== 季线转换开始 ===")
+                    log_callback(f"日线数据总量: {len(all_stocks)} 只股票")
+                    log_callback(f"需要转换: {total_stocks} 只股票")
+                    log_callback(f"每 {SAVE_INTERVAL} 只保存一次")
+                    log_callback(f"{'='*40}")
+
+                # 批量收集数据
+                batch_buffer = []  # [(stock_code, quarterly_data), ...]
 
                 for i, stock_code in enumerate(stocks_to_process):
                     while self.paused and not self.stopped:
@@ -381,21 +354,24 @@ class DataConverter:
                     if self.stopped:
                         break
 
+                    # 详细日志：每只股票
+                    if log_callback and (i == 0 or i % 50 == 0):
+                        elapsed = time.time() - self.start_time
+                        speed = self.processed_count / elapsed if elapsed > 0 else 0
+                        eta = (total_stocks - i) / speed if speed > 0 else 0
+                        log_callback(f"[{i+1}/{total_stocks}] 进度:{int((i+1)/total_stocks*100)}% "
+                                     f"已处理:{self.processed_count} 跳过:{self.skipped_count} "
+                                     f"速度:{speed:.1f}/s ETA:{eta:.0f}s -> {stock_code}")
+
                     if skip_optimize and self.continuous_skip >= MAX_SKIP_CONTINUOUS:
                         if log_callback:
-                            log_callback(f"连续跳过 {MAX_SKIP_CONTINUOUS} 只股票，自动跳过剩余")
-                        with self.db_manager.seasonly_connection() as seasonly_conn:
-                            remaining_stocks = stocks_to_process[i:]
-                            seasonly_conn.execute("BEGIN TRANSACTION")
-                            for code in remaining_stocks:
-                                seasonly_conn.execute("""
-                                    INSERT OR REPLACE INTO seasonly_last_download_time (code, last_update)
-                                    VALUES (?, CURRENT_TIMESTAMP)
-                                """, [code])
-                            seasonly_conn.execute("COMMIT")
+                            log_callback(f"连续跳过 {MAX_SKIP_CONTINUOUS} 只股票，停止处理")
                         break
 
-                    self.process_stock(stock_code)
+                    result = self.process_stock_with_data(stock_code)
+                    if result:
+                        stock_code, quarterly_data = result
+                        batch_buffer.append((stock_code, quarterly_data))
 
                     elapsed = time.time() - self.start_time
                     speed = self.processed_count / elapsed if elapsed > 0 else 0
@@ -404,11 +380,29 @@ class DataConverter:
                     if self.progress_callback:
                         self.progress_callback(progress, self.processed_count, self.skipped_count, speed, f"正在处理: {stock_code}")
 
-                    if i % 20 == 0:
+                    # 每 SAVE_INTERVAL 只保存一次
+                    if len(batch_buffer) >= SAVE_INTERVAL:
+                        if log_callback:
+                            log_callback(f"--- 保存批次: {len(batch_buffer)} 只股票 ---")
+                        self._save_batch(batch_buffer)
+                        batch_buffer.clear()
                         gc.collect()
 
+                # 保存剩余数据
+                if batch_buffer:
+                    if log_callback:
+                        log_callback(f"--- 保存剩余批次: {len(batch_buffer)} 只股票 ---")
+                    self._save_batch(batch_buffer)
+                    batch_buffer.clear()
+
+                total_elapsed = time.time() - self.start_time
                 if log_callback:
-                    log_callback(f"季线转换完成: 已处理: {self.processed_count}，跳过: {self.skipped_count}")
+                    log_callback(f"{'='*40}")
+                    log_callback(f"=== 季线转换完成 ===")
+                    log_callback(f"总耗时: {total_elapsed:.1f}s")
+                    log_callback(f"成功转换: {self.processed_count} 只")
+                    log_callback(f"跳过: {self.skipped_count} 只")
+                    log_callback(f"平均速度: {self.processed_count/total_elapsed:.1f}只/s")
 
         except Exception as e:
             logger.error(f"转换任务失败: {str(e)}")
@@ -416,6 +410,63 @@ class DataConverter:
         finally:
             if self.progress_callback:
                 self.progress_callback(100, self.processed_count, self.skipped_count, 0, "处理完成")
+
+    def process_stock_with_data(self, stock_code):
+        """处理单只股票并返回季度数据，不立即保存"""
+        try:
+            with self.db_manager.daily_connection() as daily_conn:
+                data_mapping = self.resolve_column_names(daily_conn, 'dayly_stock_data')
+                if not data_mapping or 'code' not in data_mapping or 'date' not in data_mapping:
+                    logger.error(f"无法解析日线数据表列名，跳过股票 {stock_code}")
+                    return None
+                with self.db_manager.seasonly_connection() as seasonly_conn:
+                    self.init_seasonly_database(seasonly_conn)
+                    need_update, last_update = self.needs_update(seasonly_conn, stock_code, daily_conn, data_mapping)
+                    if not need_update:
+                        self.skipped_count += 1
+                        self.continuous_skip += 1
+                        return None
+                    quarterly_data = self.convert_to_quarterly(daily_conn, seasonly_conn, stock_code, data_mapping, last_update)
+                    if quarterly_data is None:
+                        self.skipped_count += 1
+                        self.continuous_skip += 1
+                        return None
+                    self.processed_count += 1
+                    self.continuous_skip = 0
+                    return (stock_code, quarterly_data)
+        except Exception as e:
+            logger.error(f"处理股票 {stock_code} 时出错: {str(e)}")
+            return None
+
+    def _save_batch(self, batch_buffer):
+        """批量保存季度数据"""
+        if not batch_buffer:
+            return
+        try:
+            with self.db_manager.seasonly_connection() as seasonly_conn:
+                seasonly_conn.execute("BEGIN TRANSACTION")
+                saved_count = 0
+                for stock_code, quarterly_data in batch_buffer:
+                    if not quarterly_data:
+                        continue
+                    for row in quarterly_data:
+                        seasonly_conn.execute("""
+                            INSERT OR REPLACE INTO seasonly_stock_data (code, date, open, high, low, close, volume, amount)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [stock_code, row[0], row[1], row[2], row[3], row[4], row[5], row[6]])
+                    seasonly_conn.execute("""
+                        INSERT OR REPLACE INTO seasonly_last_download_time (code, last_update)
+                        VALUES (?, CURRENT_TIMESTAMP)
+                    """, [stock_code])
+                    saved_count += 1
+                seasonly_conn.execute("COMMIT")
+                logger.info(f"批量保存完成: {saved_count}/{len(batch_buffer)} 只股票")
+        except Exception as e:
+            try:
+                seasonly_conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            logger.error(f"批量保存失败: {str(e)}")
 
 
 # ==================== 模块接口 ====================
@@ -425,10 +476,6 @@ def run_module(use_index=True, skip_optimize=True, progress_callback=None, log_c
         log_callback("开始季线数据转换...")
 
     converter = DataConverter(None, progress_callback)
-    if not converter.is_last_trading_day_of_quarter():
-        if log_callback:
-            log_callback(f"当前不是季度末最后交易日17:00后，跳过季线转换。当前时间: {converter.current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        return None
     if converter.has_current_quarter_data(SEASONLY_DB_PATH):
         if log_callback:
             log_callback("本季度数据已存在，跳过季线转换")

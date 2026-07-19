@@ -451,9 +451,14 @@ class StockDownloader:
             year = int(date_str[:4])
             month = int(date_str[5:7])
             day = int(date_str[8:10])
-            time_part = time_str[:4] if len(time_str) >= 4 else time_str
-            hour = int(time_part[:2])
-            minute = int(time_part[2:4])
+            if len(time_str) >= 12:
+                hhmm = time_str[8:12]
+            elif len(time_str) >= 4:
+                hhmm = time_str[:4]
+            else:
+                hhmm = time_str
+            hour = int(hhmm[:2])
+            minute = int(hhmm[2:4])
             return datetime.datetime(year, month, day, hour, minute)
         except:
             return None

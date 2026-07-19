@@ -24,6 +24,7 @@ from minute5_stock_data_download import run_module as run_5min_module
 from monthly_stock_data_download import run_module as run_monthly_module
 from seasonly_stock_data_download import run_module as run_seasonly_module
 from weekly_stock_data_download import run_module as run_weekly_module
+from yearly_stock_data_download import run_module as run_yearly_module
 
 warnings.filterwarnings('ignore')
 
@@ -1672,16 +1673,42 @@ class StockDownloader:
             self.log_message(f"[线程数: {thread_count}] [批量提交: {batch_size}行]")
             self.log_message(f"[上市日期] 从本地数据库加载了 {len(self.stock_ipo_dates)} 只股票的上市日期")
             self.log_message(f"[断点续传] 已下载 {len(self.downloaded_stocks)} 只股票记录")
-            
+
+            # ====== 周线/月线/季线/年线：从日线数据库聚合，无需baostock登录 ======
+            long_period = ['week', 'month', 'season', 'year']
+            for period in long_period:
+                if self.period_vars[period].get() and self.is_running:
+                    self.log_message(f"{period}选项已勾选，运行模块...")
+                    try:
+                        if period == 'week':
+                            run_weekly_module(
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == 'month':
+                            run_monthly_module(
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == 'season':
+                            run_seasonly_module(
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                        elif period == 'year':
+                            run_yearly_module(
+                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
+                            )
+                    except Exception as e:
+                        self.log_message(f"运行{period}模块失败: {e}", "ERROR")
+
+            # ====== 日线 + 分钟线：需要baostock登录 ======
             if not self.ensure_login():
                 self.log_message("登录失败，无法继续下载", "ERROR")
                 return
-            
+
             if self.period_vars['day'].get() and self.is_running:
                 self.process_dayly_stocks_single_thread(stocks)
-            
-            other_periods = ['week', 'month', 'season', 'year', '60min', '30min', '15min', '5min']
-            for period in other_periods:
+
+            minute_periods = ['60min', '30min', '15min', '5min']
+            for period in minute_periods:
                 if self.period_vars[period].get() and self.is_running:
                     self.log_message(f"{period}选项已勾选，运行模块...")
                     try:
@@ -1709,25 +1736,9 @@ class StockDownloader:
                                 force=False,
                                 log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
                             )
-                        elif period == 'week':
-                            run_weekly_module(
-                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
-                            )
-                        elif period == 'month':
-                            run_monthly_module(
-                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
-                            )
-                        elif period == 'season':
-                            run_seasonly_module(
-                                log_callback=lambda msg, p=period: self.log_message(f"[{p}] {msg}")
-                            )
-                        elif period == 'year':
-                            self.log_message("年线模块暂未实现", "WARNING")
-                        else:
-                            self.log_message(f"{period}模块暂未实现", "WARNING")
                     except Exception as e:
                         self.log_message(f"运行{period}模块失败: {e}", "ERROR")
-            
+
             with self.temp_table_lock:
                 if self.temp_table_created and self.downloaded_rows > 0:
                     self.log_message("下载完成，执行最终保存", "INFO")
