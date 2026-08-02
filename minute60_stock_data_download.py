@@ -545,9 +545,13 @@ class StockDownloader:
             ).fetchone()[0]
             if current_count > config.max_records + config.tolerance:
                 to_delete = current_count - config.max_records
+                # 用 ROW_NUMBER 替代 ORDER BY + LIMIT，避免 DuckDB 兼容问题
                 self.con.execute("""
                     DELETE FROM minute60_data WHERE code=? AND date_time IN (
-                        SELECT date_time FROM minute60_data WHERE code=? ORDER BY date_time LIMIT ?
+                        SELECT date_time FROM (
+                            SELECT date_time, ROW_NUMBER() OVER (ORDER BY date_time ASC) AS rn
+                            FROM minute60_data WHERE code=?
+                        ) WHERE rn <= ?
                     )
                 """, [c, c, to_delete])
             logger.info(f"{c} 保存{len(new_records)}条, 当前{current_count}条")
@@ -563,13 +567,18 @@ class StockDownloader:
             current_count = self.con.execute(
                 "SELECT COUNT(*) FROM minute60_data WHERE code=?", [c]
             ).fetchone()[0]
-            if current_count > config.max_records:
+            if current_count > config.max_records + config.tolerance:
                 to_delete = current_count - config.max_records
-                self.con.execute("""
-                    DELETE FROM minute60_data WHERE code=? AND date_time IN (
-                        SELECT date_time FROM minute60_data WHERE code=? ORDER BY date_time ASC LIMIT ?
-                    )
-                """, [c, c, to_delete])
+                # 先查出要删除的date_time列表，再批量删除（避免DuckDB IN子查询索引问题）
+                old_dates = self.con.execute("""
+                    SELECT date_time FROM minute60_data WHERE code=? ORDER BY date_time ASC LIMIT ?
+                """, [c, to_delete]).fetchall()
+                if old_dates:
+                    old_date_list = [row[0] for row in old_dates]
+                    placeholders = ','.join(['?'] * len(old_date_list))
+                    self.con.execute(f"""
+                        DELETE FROM minute60_data WHERE code=? AND date_time IN ({placeholders})
+                    """, [c] + old_date_list)
                 logger.info(f"{c} 清理{to_delete}条旧数据，当前{current_count - to_delete}条")
         except Exception as e:
             logger.error(f"{code} 清理失败: {e}")
@@ -665,18 +674,14 @@ class StockDownloader:
             log_callback(f"[日期组:{group_key}] 共{len(group_codes)}只股票")
 
         if group_key == 'new':
-            # 无数据的股票：从上市日期开始下载
+            # 无数据的股票：从当前日期向前推2个月开始下载
+            now = datetime.datetime.now()
+            sd = (now - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+            ed = now.strftime("%Y-%m-%d")
             for code in group_codes:
                 total_processed += 1
                 if progress:
-                    progress(total_processed, len(self._all_stocks_list), code, "新股上市起下载")
-
-                stock_info = self.get_stock_list_info(code)
-                if stock_info and 'startDateTime' in stock_info:
-                    sd = stock_info['startDateTime'][:10]
-                else:
-                    sd = "2005-01-01"
-                ed = datetime.datetime.now().strftime("%Y-%m-%d")
+                    progress(total_processed, len(self._all_stocks_list), code, "向前推2个月下载")
 
                 data, msg = self._download_range(code, sd, ed, force=True)
                 if data:

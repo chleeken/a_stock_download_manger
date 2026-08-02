@@ -473,7 +473,8 @@ class StockDownloader:
             max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
             now = datetime.datetime.now()
             if force or max_date is None:
-                sd = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+                # 数据库无数据时，从上一个月开始下载
+                sd = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
                 ed = now.strftime("%Y-%m-%d")
             else:
                 sd = (max_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")

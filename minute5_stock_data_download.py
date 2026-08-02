@@ -466,7 +466,7 @@ class StockDownloader:
             logger.error(f"{code} 保存失败:{e}")
             return False, str(e)
 
-    def download_stock(self, code, force=False, days=365):
+    def download_stock(self, code, force=False, days=15):
         try:
             c = self.norm(code)
             if not c:
@@ -479,9 +479,11 @@ class StockDownloader:
             max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
             now = datetime.datetime.now()
             if force or max_date is None:
+                # 数据库无数据：从当前日期的上半个月开始下载
                 sd = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
                 ed = now.strftime("%Y-%m-%d")
             else:
+                # 数据库有数据：从最后下载日期开始下载
                 sd = (max_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
                 ed = now.strftime("%Y-%m-%d")
                 if sd > ed:
