@@ -1014,6 +1014,14 @@ class StockDownloaderCore:
             os.makedirs(self.data_dir, exist_ok=True)
             self._log(f"开始下载股票数据，共{len(stocks_filtered)}只股票...")
 
+            # ====== 日线：需要baostock登录 ======
+            if 'day' in selected_periods:
+                if not self.ensure_login():
+                    self._log("登录失败，无法继续下载", "ERROR")
+                    return
+                if self.is_running:
+                    self.process_dayly_stocks_single_thread(stocks_filtered)
+
             # ====== 周线/月线/季线/年线：从日线数据库聚合，无需baostock登录 ======
             long_periods = [p for p in ['week', 'month', 'season', 'year'] if p in selected_periods]
             _long_period_module_map = {
@@ -1036,14 +1044,7 @@ class StockDownloaderCore:
                 if self.is_running:
                     self.cleanup_temp_tables(period)
 
-            # ====== 日线 + 分钟线：需要baostock登录 ======
-            if 'day' in selected_periods:
-                if not self.ensure_login():
-                    self._log("登录失败，无法继续下载", "ERROR")
-                    return
-                if self.is_running:
-                    self.process_dayly_stocks_single_thread(stocks_filtered)
-
+            # ====== 分钟线：需要baostock登录 ======
             minute_periods = [p for p in ['60min', '30min', '15min', '5min'] if p in selected_periods]
             _minute_period_module_map = {
                 '60min': 'minute60_stock_data_download',
@@ -1644,6 +1645,14 @@ class StockDownloaderCore:
             os.makedirs(self.data_dir, exist_ok=True)
             self._log(f"开始下载股票数据，共{len(stocks_filtered)}只股票...")
 
+            # ====== 日线：需要baostock登录 ======
+            if 'day' in selected_periods:
+                if not self.ensure_login():
+                    self._log("登录失败，无法继续下载", "ERROR")
+                    return
+                if self.is_running:
+                    self.process_dayly_stocks_single_thread(stocks_filtered)
+
             # ====== 周线/月线/季线/年线：从日线数据库聚合，无需baostock登录 ======
             long_periods = [p for p in ['week', 'month', 'season', 'year'] if p in selected_periods]
             _long_period_module_map = {
@@ -1666,14 +1675,7 @@ class StockDownloaderCore:
                 if self.is_running:
                     self.cleanup_temp_tables(period)
 
-            # ====== 日线 + 分钟线：需要baostock登录 ======
-            if 'day' in selected_periods:
-                if not self.ensure_login():
-                    self._log("登录失败，无法继续下载", "ERROR")
-                    return
-                if self.is_running:
-                    self.process_dayly_stocks_single_thread(stocks_filtered)
-
+            # ====== 分钟线：需要baostock登录 ======
             minute_periods = [p for p in ['60min', '30min', '15min', '5min'] if p in selected_periods]
             _minute_period_module_map = {
                 '60min': 'minute60_stock_data_download',
@@ -2274,6 +2276,14 @@ class StockDownloaderCore:
             os.makedirs(self.data_dir, exist_ok=True)
             self._log(f"开始下载股票数据，共{len(stocks_filtered)}只股票...")
 
+            # ====== 日线：需要baostock登录 ======
+            if 'day' in selected_periods:
+                if not self.ensure_login():
+                    self._log("登录失败，无法继续下载", "ERROR")
+                    return
+                if self.is_running:
+                    self.process_dayly_stocks_single_thread(stocks_filtered)
+
             # ====== 周线/月线/季线/年线：从日线数据库聚合，无需baostock登录 ======
             long_periods = [p for p in ['week', 'month', 'season', 'year'] if p in selected_periods]
             _long_period_module_map = {
@@ -2296,14 +2306,7 @@ class StockDownloaderCore:
                 if self.is_running:
                     self.cleanup_temp_tables(period)
 
-            # ====== 日线 + 分钟线：需要baostock登录 ======
-            if 'day' in selected_periods:
-                if not self.ensure_login():
-                    self._log("登录失败，无法继续下载", "ERROR")
-                    return
-                if self.is_running:
-                    self.process_dayly_stocks_single_thread(stocks_filtered)
-
+            # ====== 分钟线：需要baostock登录 ======
             minute_periods = [p for p in ['60min', '30min', '15min', '5min'] if p in selected_periods]
             _minute_period_module_map = {
                 '60min': 'minute60_stock_data_download',

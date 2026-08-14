@@ -269,18 +269,21 @@ class WeekConverter:
             FROM weekly_group ORDER BY week_date
             """
 
-            weekly_result = day_conn.execute(weekly_query).to_arrow_table()
-            if weekly_result.num_rows == 0:
+            # 使用duckdb原生方式，无需pyarrow依赖
+            weekly_query_obj = day_conn.execute(weekly_query)
+            # 先将查询结果转换为pandas DataFrame（避免fetchone消费游标）
+            weekly_df = weekly_query_obj.df()
+            # 检查是否有结果
+            if len(weekly_df) == 0:
                 self.stats['stocks_skipped'] += 1
                 return False
-
-            weeks_added = weekly_result.num_rows
+            week_conn.register("temp_weekly_source", weekly_df)
+            weeks_added = week_conn.execute(f"SELECT COUNT(*) FROM temp_weekly_source").fetchone()[0]
             self._log(f"  生成 {weeks_added} 周数据")
 
             try:
-                week_conn.register("temp_weekly_view", weekly_result)
-                week_conn.execute(f"INSERT OR REPLACE INTO {self.main_table} SELECT * FROM temp_weekly_view")
-                week_conn.execute("DROP VIEW IF EXISTS temp_weekly_view")
+                week_conn.execute(f"INSERT OR REPLACE INTO {self.main_table} SELECT * FROM temp_weekly_source")
+                week_conn.execute("DROP VIEW IF EXISTS temp_weekly_source")
                 self.stats['weekly_rows_added'] += weeks_added
                 self.stats['stocks_processed'] += 1
                 self._log(f"  成功处理 {stock_code}: 新增/更新 {weeks_added} 周数据")
