@@ -115,6 +115,30 @@ class DataConverter:
         except Exception:
             return False
 
+    def needs_yearly_update(self, stock_code, daily_conn, data_mapping, yearly_conn):
+        """检查是否需要更新年线数据，返回 (need_update, last_update)"""
+        try:
+            result = yearly_conn.execute(
+                "SELECT last_update FROM yearly_last_download_time WHERE code = ?",
+                [stock_code]
+            ).fetchone()
+            if not result:
+                return True, None
+            last_update = result[0]
+            code_col = data_mapping['code']
+            date_col = data_mapping['date']
+            latest_daily = daily_conn.execute(f"""
+                SELECT MAX({date_col}) FROM dayly_stock_data WHERE {code_col} = ?
+            """, [stock_code]).fetchone()[0]
+            if not latest_daily:
+                return False, None
+            if latest_daily > last_update.date():
+                return True, last_update
+            return False, None
+        except Exception as e:
+            logger.error(f"检查更新状态失败 {stock_code}: {str(e)}")
+            return True, None
+
     def pause(self):
         self.paused = True
 
@@ -466,12 +490,6 @@ def run_module(use_index=True, skip_optimize=True, progress_callback=None, log_c
     """被主程序调用的模块入口"""
     if log_callback:
         log_callback("开始年线数据转换...")
-
-    converter = DataConverter(None, progress_callback)
-    if converter.has_current_year_data(YEARLY_DB_PATH):
-        if log_callback:
-            log_callback("本年度数据已存在，跳过年线转换")
-        return None
 
     db_manager = DatabaseManager()
     converter = DataConverter(db_manager, progress_callback)

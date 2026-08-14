@@ -678,10 +678,15 @@ class StockDownloader:
             now = datetime.datetime.now()
             sd = (now - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
             ed = now.strftime("%Y-%m-%d")
+            group_start_time = time.time()
             for code in group_codes:
                 total_processed += 1
                 if progress:
                     progress(total_processed, len(self._all_stocks_list), code, "向前推2个月下载")
+                if log_callback and total_processed % 10 == 0:
+                    elapsed = time.time() - group_start_time
+                    speed = total_processed / elapsed if elapsed > 0 else 0
+                    log_callback(f"进度: {total_processed}/{len(self._all_stocks_list)} ({total_processed*100//len(self._all_stocks_list)}%), {speed:.2f}只/秒 当前:{code}")
 
                 data, msg = self._download_range(code, sd, ed, force=True)
                 if data:
@@ -689,11 +694,15 @@ class StockDownloader:
                     if success:
                         result['s'] += 1
                         if log_callback:
-                            log_callback(f"  {code}: {save_msg}")
+                            log_callback(f"✓ {code}: {save_msg}")
                     else:
                         result['f'] += 1
+                        if log_callback:
+                            log_callback(f"✗ {code}: {save_msg}")
                 else:
                     result['k'] += 1
+                    if log_callback:
+                        log_callback(f"跳过 {code}: {msg}")
                 time.sleep(config.request_delay)
 
             return result, total_processed
@@ -732,10 +741,15 @@ class StockDownloader:
             log_callback(f"  抽样有数据，最早可下载:{earliest_available}，开始全组下载")
 
         # 全组按可下载日期批量下载
+        group_start_time = time.time()
         for code in group_codes:
             total_processed += 1
             if progress:
                 progress(total_processed, len(self._all_stocks_list), code, "日期组下载")
+            if log_callback and total_processed % 10 == 0:
+                elapsed = time.time() - group_start_time
+                speed = total_processed / elapsed if elapsed > 0 else 0
+                log_callback(f"进度: {total_processed}/{len(self._all_stocks_list)} ({total_processed*100//len(self._all_stocks_list)}%), {speed:.2f}只/秒 当前:{code}")
 
             info = self._stock_cache.get(code, {})
             last_d = info.get('max_date')
@@ -754,11 +768,15 @@ class StockDownloader:
                     self.cleanup_excess_records(code)
                     result['s'] += 1
                     if log_callback:
-                        log_callback(f"  {code}: {save_msg}")
+                        log_callback(f"✓ {code}: {save_msg}")
                 else:
                     result['f'] += 1
+                    if log_callback:
+                        log_callback(f"✗ {code}: {save_msg}")
             else:
                 result['k'] += 1
+                if log_callback:
+                    log_callback(f"跳过 {code}: {msg}")
             time.sleep(config.request_delay)
 
         return result, total_processed

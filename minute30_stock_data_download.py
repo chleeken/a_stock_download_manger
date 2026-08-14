@@ -545,6 +545,7 @@ class StockDownloader:
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(download_list))
             batch_codes = download_list[start_idx:end_idx]
+            batch_start_time = time.time()
 
             if log_callback:
                 log_callback(f"处理第{batch_idx + 1}/{total_batches}批, {len(batch_codes)}只股票")
@@ -562,20 +563,40 @@ class StockDownloader:
                     if data is None:
                         if "无新数据" in msg:
                             batch_skip += 1
+                            if log_callback:
+                                log_callback(f"跳过 {code}: {msg}")
                         else:
                             batch_fail += 1
+                            if log_callback:
+                                log_callback(f"✗ {code}: {msg}")
                     else:
                         success, save_msg = self.save_single_stock(code, data)
                         if success:
                             batch_success += 1
                             if log_callback:
-                                log_callback(f"{code}: {save_msg}")
+                                log_callback(f"✓ {code}: {save_msg}")
                         else:
                             batch_fail += 1
+                            if log_callback:
+                                log_callback(f"✗ {code}: {save_msg}")
                     time.sleep(config.request_delay)
+
+                    # 进度报告（每10只）
+                    batch_idx_local = list(batch_codes).index(code)
+                    global_idx = start_idx + batch_idx_local
+                    if log_callback and (global_idx + 1) % 10 == 0:
+                        elapsed = time.time() - batch_start_time
+                        speed = (global_idx + 1) / elapsed if elapsed > 0 else 0
+                        log_callback(f"进度: {global_idx+1}/{len(download_list)} ({(global_idx+1)*100//len(download_list)}%), {speed:.2f}只/秒 当前:{code}")
+
+                    if progress:
+                        progress(global_idx + 1, len(download_list), code, f"已处理 {global_idx+1}/{len(download_list)}")
+
                 except Exception as e:
                     logger.error(f"{code} 处理异常:{str(e)}")
                     batch_fail += 1
+                    if log_callback:
+                        log_callback(f"✗ {code}: {e}")
 
             res['s'] += batch_success
             res['k'] += batch_skip

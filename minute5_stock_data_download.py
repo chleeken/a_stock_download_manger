@@ -516,14 +516,16 @@ class StockDownloader:
 
             if data is None:
                 fail_count += 1
+                if log_callback:
+                    log_callback(f"✗ {code}: {msg}" if msg and "已是最新" not in msg and "无新数据" not in msg else f"跳过 {code}: {msg}")
                 if msg and "已是最新" not in msg and "无新数据" not in msg:
                     fail_list.append((code, msg))
-                    if log_callback:
-                        log_callback(f"{code}: {msg}")
             else:
                 processed = _process_data(data, fields, code, max_date)
                 if not processed:
                     fail_count += 1
+                    if log_callback:
+                        log_callback(f"跳过 {code}: 处理后无新数据")
                     continue
 
                 filtered = _filter_time_points(processed)
@@ -536,17 +538,21 @@ class StockDownloader:
                     else:
                         fail_count += 1
                         fail_list.append((code, save_msg))
+                        if log_callback:
+                            log_callback(f"✗ {code}: 保存失败 {save_msg}")
                 else:
                     fail_count += 1
+                    if log_callback:
+                        log_callback(f"跳过 {code}: 过滤后无有效数据")
 
-            # 进度报告
-            if log_callback and (i + 1) % 50 == 0:
+            # 进度报告（每5只）
+            if log_callback and (i + 1) % 5 == 0:
                 elapsed = time.time() - start_time
                 speed = (i + 1) / elapsed if elapsed > 0 else 0
-                log_callback(f"进度: {i+1}/{total} ({(i+1)*100//total}%), {speed:.2f}只/秒")
+                log_callback(f"进度: {i+1}/{total} ({(i+1)*100//total}%), {speed:.2f}只/秒 当前:{code}")
 
             if progress:
-                progress(i + 1, total, "", f"已处理 {i+1}/{total}")
+                progress(i + 1, total, code, f"已处理 {i+1}/{total}")
 
             # 定期检查点
             if (i + 1) % config.batch_size == 0:

@@ -227,6 +227,49 @@ class DatabaseManager:
             logger.error(f"批量更新索引失败: {e}")
             return False
 
+    def convert_daily_to_monthly_sql(self, code: str) -> List[Dict]:
+        """使用SQL聚合将日线转为月线"""
+        if not self.daily_conn or not self.monthly_conn:
+            return []
+        try:
+            columns = self.get_daily_table_columns()
+            code_col = self.detect_column_name(self.code_column_names, columns)
+            date_col = self.detect_column_name(self.date_column_names, columns)
+            if not code_col or not date_col:
+                return []
+
+            query = f"""
+                SELECT {code_col} as code,
+                       DATE_TRUNC('month', {date_col}) as month_start,
+                       FIRST(open ORDER BY {date_col}) as open,
+                       MAX(high) as high,
+                       MIN(low) as low,
+                       LAST(close ORDER BY {date_col}) as close,
+                       SUM(volume) as volume,
+                       SUM(amount) as amount
+                FROM {Config.DAILY_TABLE}
+                WHERE {code_col} = ?
+                GROUP BY {code_col}, DATE_TRUNC('month', {date_col})
+                ORDER BY month_start
+            """
+            result = self.daily_conn.execute(query, [code]).fetchall()
+            data = []
+            for row in result:
+                data.append({
+                    'code': row[0],
+                    'date': row[1],
+                    'open': float(row[2]) if row[2] else 0.0,
+                    'high': float(row[3]) if row[3] else 0.0,
+                    'low': float(row[4]) if row[4] else 0.0,
+                    'close': float(row[5]) if row[5] else 0.0,
+                    'volume': float(row[6]) if row[6] else 0.0,
+                    'amount': float(row[7]) if row[7] else 0.0
+                })
+            return data
+        except Exception as e:
+            logger.error(f"SQL聚合月线失败 {code}: {e}")
+            return []
+
 
 class DataProcessor:
     def __init__(self, db_manager: DatabaseManager):
@@ -239,68 +282,33 @@ class DataProcessor:
         self.pause_flag = False
         self.current_time = datetime.now()
 
-    def has_current_month_data(self, monthly_db_path: Path) -> bool:
+    def needs_monthly_update(self, code: str) -> Tuple[bool, Optional[date]]:
+        """检查是否需要更新月线数据，返回 (need_update, start_date)"""
         try:
-            conn = duckdb.connect(str(monthly_db_path))
-            result = conn.execute("SELECT MAX(date) FROM monthly_data").fetchone()
-            conn.close()
-            max_date = result[0] if result else None
-            if not max_date:
-                return False
-            today = self.current_time.date()
-            month_start = today.replace(day=1)
-            return max_date >= month_start
-        except Exception:
-            return False
-
-    @staticmethod
-    def daily_to_monthly(daily_data: List[Dict]) -> List[Dict]:
-        if not daily_data:
-            return []
-        monthly_map = {}
-        for day in daily_data:
-            month_key = day['date'].strftime('%Y-%m')
-            if month_key not in monthly_map:
-                monthly_map[month_key] = {
-                    'code': day['code'],
-                    'date': day['date'].replace(day=1),
-                    'open': day['open'], 'high': day['high'], 'low': day['low'],
-                    'close': day['close'], 'volume': day['volume'], 'amount': day['amount'],
-                    'days': [day]
-                }
-            else:
-                month_data = monthly_map[month_key]
-                month_data['high'] = max(month_data['high'], day['high'])
-                month_data['low'] = min(month_data['low'], day['low'])
-                month_data['close'] = day['close']
-                month_data['volume'] += day['volume']
-                month_data['amount'] += day['amount']
-                month_data['days'].append(day)
-        result = []
-        for month_key in sorted(monthly_map.keys()):
-            data = monthly_map[month_key]
-            result.append({
-                'code': data['code'], 'date': data['date'],
-                'open': data['open'], 'high': data['high'], 'low': data['low'],
-                'close': data['close'], 'volume': data['volume'], 'amount': data['amount']
-            })
-        return result
-
-    def should_process_stock(self, code: str, skip_optimization: bool) -> Tuple[bool, Optional[date]]:
-        try:
+            if not self.db.monthly_conn:
+                return True, None
             last_date = self.db.get_last_monthly_date(code)
             if not last_date:
                 return True, None
-            if not skip_optimization:
-                return True, last_date
             daily_data = self.db.get_stock_daily_data(code)
             if not daily_data:
                 return False, None
-            latest_daily_date = daily_data[-1]['date']
-            has_new_data = latest_daily_date > last_date
-            if has_new_data:
-                self.stats['consecutive_skips'] = 0
+            latest_daily = daily_data[-1]['date']
+            if latest_daily > last_date:
                 return True, last_date
+            return False, None
+        except Exception as e:
+            logger.error(f"判断股票{code}月线更新状态失败: {e}")
+            return True, None
+
+    def should_process_stock(self, code: str, skip_optimization: bool) -> Tuple[bool, Optional[date]]:
+        try:
+            if not skip_optimization:
+                return True, None
+            need_update, start_date = self.needs_monthly_update(code)
+            if need_update:
+                self.stats['consecutive_skips'] = 0
+                return True, start_date
             else:
                 self.stats['consecutive_skips'] += 1
                 return False, None
@@ -314,10 +322,7 @@ class DataProcessor:
     def process_stock(self, code: str, start_date: Optional[date] = None,
                       skip_optimization: bool = True) -> Tuple[bool, int]:
         try:
-            daily_data = self.db.get_stock_daily_data(code, start_date)
-            if not daily_data:
-                return True, 0
-            monthly_data = self.daily_to_monthly(daily_data)
+            monthly_data = self.db.convert_daily_to_monthly_sql(code)
             if not monthly_data:
                 return True, 0
             today = date.today()
@@ -403,13 +408,6 @@ class DataProcessor:
 # ==================== 模块接口 ====================
 def run_module(skip_optimization=True, progress_callback=None, log_callback=None):
     """被主程序调用的模块入口"""
-    processor = DataProcessor(None)
-
-    if processor.has_current_month_data(Config.MONTHLY_DB_PATH):
-        if log_callback:
-            log_callback("本月数据已存在，跳过月线转换")
-        return None
-
     db_manager = DatabaseManager(Config.DAILY_DB_PATH, Config.MONTHLY_DB_PATH)
     if not db_manager.connect():
         if log_callback:
