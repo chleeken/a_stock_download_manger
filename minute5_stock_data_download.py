@@ -9,6 +9,7 @@ import datetime
 import time
 import gc
 import logging
+import random
 from pathlib import Path
 from functools import wraps
 import sys
@@ -57,7 +58,8 @@ class Config:
                  'request_delay', 'retry_times', 'batch_size', 'skip_threshold',
                  'wal_auto_checkpoint', 'wal_checkpoint_size', 'enable_wal',
                  'market_hours_only', 'no_data_threshold', 'batch_check_size',
-                 'max_workers', 'timeout_per_stock')
+                 'max_workers', 'timeout_per_stock',
+                 'group_sample_size', 'group_query_timeout')
 
     def __init__(self):
         self.max_records = 400
@@ -77,6 +79,8 @@ class Config:
         self.batch_check_size = 500
         self.max_workers = 5
         self.timeout_per_stock = 12
+        self.group_sample_size = 5
+        self.group_query_timeout = 15
 
     @property
     def default_db_path(self):
@@ -96,6 +100,17 @@ logger.propagate = False
 
 
 # ==================== 下载函数（子进程安全） ====================
+_bs_logged_in = False
+
+def _ensure_baostock_login():
+    global _bs_logged_in
+    if not _bs_logged_in:
+        lg = bs.login()
+        if lg.error_code == '0':
+            _bs_logged_in = True
+        elif '已经登录' in lg.error_msg or '已登录' in lg.error_msg:
+            _bs_logged_in = True
+
 def _download_single(code, max_date, force, timeout, retry_times):
     """下载单只股票数据（线程安全版本）"""
     c = ''.join(filter(str.isdigit, str(code)))
@@ -117,10 +132,7 @@ def _download_single(code, max_date, force, timeout, retry_times):
 
     for attempt in range(retry_times):
         try:
-            lg = bs.login()
-            if lg.error_code != '0':
-                time.sleep(0.3)
-                continue
+            _ensure_baostock_login()
 
             rs = bs.query_history_k_data_plus(
                 full_code, "date,time,open,high,low,close,volume,amount",
@@ -128,8 +140,11 @@ def _download_single(code, max_date, force, timeout, retry_times):
             )
 
             if rs.error_code != '0':
-                try: bs.logout()
-                except: pass
+                is_network_error = any(k in rs.error_msg for k in ['网络', '连接', 'socket', '超时', '10060', '10054', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
+                if is_network_error and attempt < retry_times - 1:
+                    time.sleep(0.5)
+                    _ensure_baostock_login()
+                    continue
                 if attempt < retry_times - 1:
                     time.sleep(0.3)
                     continue
@@ -138,12 +153,13 @@ def _download_single(code, max_date, force, timeout, retry_times):
             data_rows = []
             fields = None
             while rs.next():
-                data_rows.append(rs.get_row_data())
-                if fields is None:
-                    fields = rs.fields
-
-            try: bs.logout()
-            except: pass
+                try:
+                    row_data = rs.get_row_data()
+                    data_rows.append(row_data)
+                    if fields is None:
+                        fields = rs.fields
+                except Exception:
+                    continue
 
             if not data_rows:
                 return None, "无新数据", None
@@ -151,10 +167,15 @@ def _download_single(code, max_date, force, timeout, retry_times):
             return data_rows, "成功", fields
 
         except Exception as e:
-            try: bs.logout()
-            except: pass
+            err_str = str(e)
+            is_network = any(k in err_str for k in ['10060', '10053', '10054', '10061', 'socket', '连接', '网络', '超时', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
+            if is_network and attempt < retry_times - 1:
+                time.sleep(0.5)
+                _ensure_baostock_login()
+                continue
             if attempt < retry_times - 1:
-                time.sleep(0.3)
+                time.sleep(0.5)
+                _ensure_baostock_login()
                 continue
             return None, str(e), None
 
@@ -365,6 +386,54 @@ class StockDownloader:
         stock_count = self.con.execute("SELECT COUNT(DISTINCT code) FROM minute5_data").fetchone()[0]
         logger.info(f"数据库状态: {stock_count}只股票, {count}条数据")
 
+    def _check_login(self):
+        if not self._lg:
+            return False
+        if self._login_time and (datetime.datetime.now() - self._login_time).seconds > 3600:
+            logger.info("登录可能已过期，重新登录...")
+            self._logout()
+            return False
+        return True
+
+    def _login(self):
+        if self._check_login():
+            return True
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                lg = bs.login()
+                if lg.error_code == '0':
+                    self._lg = True
+                    self._login_time = datetime.datetime.now()
+                    self._login_retry = 0
+                    logger.info("登录成功")
+                    return True
+                elif '已经登录' in lg.error_msg or '已登录' in lg.error_msg:
+                    self._lg = True
+                    self._login_time = datetime.datetime.now()
+                    logger.info("检测到已登录会话，复用现有连接")
+                    return True
+                else:
+                    logger.error(f"登录失败:{lg.error_msg}")
+            except Exception as e:
+                logger.error(f"登录异常:{e}")
+            if retry < max_retries - 1:
+                wait_time = 2 ** retry
+                time.sleep(wait_time)
+        raise Exception("登录失败，请检查网络")
+
+    def _logout(self):
+        if self._lg:
+            try:
+                bs.logout()
+            except:
+                pass
+            self._lg = False
+            self._login_time = None
+
+    def _full_code(self, code):
+        return f"sh.{code}" if code[0] == '6' else f"sz.{code}"
+
     def read_file(self, f=None):
         base_dir = Path(__file__).parent.parent / "stock_data"
         p = Path(f or (base_dir / config.stock_file))
@@ -417,7 +486,7 @@ class StockDownloader:
                 cnt = info['count']
                 if cnt < config.max_records * 0.8:
                     self._need_update_list.append(code)
-                elif max_date and (now_date - max_date.date()).days >= 1:
+                elif cnt < config.max_records and max_date and (now_date - max_date.date()).days >= 1:
                     self._need_update_list.append(code)
 
         elapsed = time.time() - start_time
@@ -432,7 +501,7 @@ class StockDownloader:
             date_times = [r[1] for r in records]
             min_dt = min(date_times)
             max_dt = max(date_times)
-            
+
             with self._db_lock:
                 existing = {e[0] for e in self.con.execute(
                     "SELECT date_time FROM minute5_data WHERE code=? AND date_time BETWEEN ? AND ?",
@@ -441,14 +510,14 @@ class StockDownloader:
                 new_records = [r for r in records if r[1] not in existing]
                 if not new_records:
                     return True, "无新数据"
-                
+
                 self.con.executemany(
                     "INSERT INTO minute5_data VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new_records
                 )
                 current_count = self.con.execute(
                     "SELECT COUNT(*) FROM minute5_data WHERE code=?", [c]
                 ).fetchone()[0]
-                
+
                 if current_count > config.max_records + config.tolerance:
                     to_delete = current_count - config.max_records
                     self.con.execute("""
@@ -467,6 +536,108 @@ class StockDownloader:
             return ""
         c = ''.join(filter(str.isdigit, str(code)))
         return c.zfill(6) if len(c) == 6 else ""
+
+    def _query_sample_available_dates(self, sample_codes, days=60):
+        """查询样本股票的可下载日期，用于判断分组是否需要下载"""
+        try:
+            if not self._check_login():
+                self._login()
+
+            available_dates = set()
+            for code in sample_codes:
+                c = self.norm(code)
+                full_code = self._full_code(c)
+                now = datetime.datetime.now()
+                end_date = now.strftime("%Y-%m-%d")
+                start_date = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+                rs = bs.query_history_k_data_plus(
+                    full_code, "date",
+                    start_date=start_date, end_date=end_date, frequency="5", adjustflag="2"
+                )
+                if rs.error_code != '0':
+                    continue
+                while rs.next():
+                    available_dates.add(rs.get_row_data()[0])
+                time.sleep(config.request_delay)
+
+            return available_dates
+        except Exception as e:
+            logger.error(f"查询样本日期失败: {e}")
+            return set()
+
+    def _build_download_groups(self):
+        """按最后下载日期分组股票"""
+        if not self._stock_cache:
+            return []
+
+        groups = {}
+        for code, info in self._stock_cache.items():
+            max_date = info.get('max_date')
+            if max_date is None:
+                continue
+            date_key = max_date.date() if hasattr(max_date, 'date') else max_date
+            if date_key not in groups:
+                groups[date_key] = []
+            groups[date_key].append(code)
+
+        result = []
+        for date_key, codes in groups.items():
+            for code in codes:
+                if code in self._need_update_list:
+                    result.append((date_key, code))
+
+        result.sort(key=lambda x: x[0], reverse=True)
+
+        group_list = []
+        current_group = []
+        current_date = None
+        for date_key, code in result:
+            if date_key != current_date:
+                if current_group:
+                    group_list.append(current_group)
+                current_group = [code]
+                current_date = date_key
+            else:
+                current_group.append(code)
+        if current_group:
+            group_list.append(current_group)
+
+        return group_list
+
+    def _get_group_download_dates(self, group_codes):
+        """获取分组可下载日期（线程+Event+超时）"""
+        event = threading.Event()
+        result = {'dates': set(), 'error': None, 'completed': False}
+        timeout = config.group_query_timeout
+
+        def query_worker():
+            try:
+                sample_size = min(config.group_sample_size, len(group_codes))
+                if sample_size <= 0:
+                    return
+                sample_codes = random.sample(group_codes, sample_size)
+                dates = self._query_sample_available_dates(sample_codes)
+                result['dates'] = dates
+            except Exception as e:
+                result['error'] = str(e)
+            finally:
+                result['completed'] = True
+                event.set()
+
+        thread = threading.Thread(target=query_worker)
+        thread.daemon = True
+        thread.start()
+
+        if not event.wait(timeout):
+            logger.warning(f"查询分组可下载日期超时({timeout}s)")
+            return None, f"超时({timeout}s)"
+
+        if result['error']:
+            logger.error(f"查询分组日期失败: {result['error']}")
+            return None, result['error']
+
+        return result['dates'], None
 
     def download_optimized(self, stocks=None, force=False, progress=None, log_callback=None):
         if stocks is None:
@@ -496,94 +667,167 @@ class StockDownloader:
             log_callback(f"开始下载任务: 需下载{len(download_list)}只")
             log_callback(f"单只超时: {config.timeout_per_stock}秒, 重试: {config.retry_times}次")
 
-        total = len(download_list)
-        start_time = time.time()
+        group_list = self._build_download_groups()
+        if group_list and len(group_list) > 1:
+            if log_callback:
+                log_callback(f"检测到{len(group_list)}个日期分组，使用分组下载")
 
-        success_count = 0
-        skip_count = 0
-        fail_count = 0
-        fail_list = []
-
-        # baostock 是单连接协议，使用串行下载保证稳定
-        for i, code in enumerate(download_list):
-            max_date = self._stock_cache.get(code, {}).get('max_date') if not force else None
-
-            # 使用线程包装实现超时控制
-            data, fields, msg = _download_with_timeout(
-                code, max_date, force,
-                config.timeout_per_stock, config.retry_times
-            )
-
-            if data is None:
-                fail_count += 1
+            start_time = time.time()
+            for group_idx, group in enumerate(group_list):
                 if log_callback:
-                    log_callback(f"✗ {code}: {msg}" if msg and "已是最新" not in msg and "无新数据" not in msg else f"跳过 {code}: {msg}")
-                if msg and "已是最新" not in msg and "无新数据" not in msg:
-                    fail_list.append((code, msg))
-            else:
-                processed = _process_data(data, fields, code, max_date)
-                if not processed:
-                    fail_count += 1
+                    log_callback(f"处理第{group_idx + 1}/{len(group_list)}组, {len(group)}只股票")
+
+                if progress:
+                    progress(0, len(download_list), "", f"分组{group_idx + 1}/{len(group_list)}")
+
+                sample_codes = random.sample(group, min(config.group_sample_size, len(group)))
+                available_dates, err = self._get_group_download_dates(sample_codes)
+
+                if err:
                     if log_callback:
-                        log_callback(f"跳过 {code}: 处理后无新数据")
+                        log_callback(f"第{group_idx + 1}组查询失败，跳过该组")
                     continue
 
-                filtered = _filter_time_points(processed)
-                if filtered:
-                    success, save_msg = self.save_single_stock(code, filtered)
-                    if success:
-                        success_count += 1
+                if not available_dates:
+                    if log_callback:
+                        log_callback(f"第{group_idx + 1}组无可下载数据，跳过{len(group)}只")
+                    res['k'] += len(group)
+                    continue
+
+                for i, code in enumerate(group):
+                    max_date = self._stock_cache.get(code, {}).get('max_date') if not force else None
+                    data, fields, msg = _download_with_timeout(
+                        code, max_date, force,
+                        config.timeout_per_stock, config.retry_times
+                    )
+                    if data is None:
+                        res['f'] += 1
+                        if msg and "已是最新" not in msg and "无新数据" not in msg:
+                            if log_callback:
+                                log_callback(f"{code}: {msg}")
+                    else:
+                        processed = _process_data(data, fields, code, max_date)
+                        if not processed:
+                            res['f'] += 1
+                            continue
+                        filtered = _filter_time_points(processed)
+                        if filtered:
+                            success, save_msg = self.save_single_stock(code, filtered)
+                            if success:
+                                res['s'] += 1
+                                if log_callback:
+                                    log_callback(f"✓ {code}: {save_msg}")
+                            else:
+                                res['f'] += 1
+                        else:
+                            res['f'] += 1
+                    time.sleep(config.request_delay)
+
+                if progress:
+                    progress(len(download_list), len(download_list), "",
+                            f"分组{group_idx + 1}/{len(group_list)}完成")
+
+                if config.wal_auto_checkpoint:
+                    self.wal_manager.checkpoint(self.con)
+                gc.collect()
+        else:
+            if log_callback and group_list:
+                log_callback("仅1个日期分组，使用串行下载")
+            elif not group_list:
+                if log_callback:
+                    log_callback("无历史数据，使用串行下载")
+
+            total = len(download_list)
+            start_time = time.time()
+
+            success_count = 0
+            skip_count = 0
+            fail_count = 0
+            fail_list = []
+            count_since_last_save = 0
+
+            # baostock 是单连接协议，使用串行下载保证稳定
+            for i, code in enumerate(download_list):
+                max_date = self._stock_cache.get(code, {}).get('max_date') if not force else None
+
+                # 使用线程包装实现超时控制
+                data, fields, msg = _download_with_timeout(
+                    code, max_date, force,
+                    config.timeout_per_stock, config.retry_times
+                )
+
+                if data is None:
+                    fail_count += 1
+                    if msg and "已是最新" not in msg and "无新数据" not in msg:
+                        fail_list.append((code, msg))
                         if log_callback:
-                            log_callback(f"✓ {code}: {save_msg}")
+                            log_callback(f"{code}: {msg}")
+                else:
+                    processed = _process_data(data, fields, code, max_date)
+                    if not processed:
+                        fail_count += 1
+                        continue
+
+                    filtered = _filter_time_points(processed)
+                    if filtered:
+                        success, save_msg = self.save_single_stock(code, filtered)
+                        if success:
+                            success_count += 1
+                            count_since_last_save += 1
+                            if log_callback:
+                                log_callback(f"✓ {code}: {save_msg}")
+                        else:
+                            fail_count += 1
+                            fail_list.append((code, save_msg))
                     else:
                         fail_count += 1
-                        fail_list.append((code, save_msg))
-                        if log_callback:
-                            log_callback(f"✗ {code}: 保存失败 {save_msg}")
-                else:
-                    fail_count += 1
-                    if log_callback:
-                        log_callback(f"跳过 {code}: 过滤后无有效数据")
 
-            # 进度报告（每5只）
-            if log_callback and (i + 1) % 5 == 0:
-                elapsed = time.time() - start_time
-                speed = (i + 1) / elapsed if elapsed > 0 else 0
-                log_callback(f"进度: {i+1}/{total} ({(i+1)*100//total}%), {speed:.2f}只/秒 当前:{code}")
+                # 进度报告
+                if log_callback and (i + 1) % 50 == 0:
+                    elapsed = time.time() - start_time
+                    speed = (i + 1) / elapsed if elapsed > 0 else 0
+                    log_callback(f"进度: {i+1}/{total} ({(i+1)*100//total}%), {speed:.2f}只/秒")
+
+                if progress:
+                    progress(i + 1, total, "", f"已处理 {i+1}/{total}")
+
+                # 每200只股票保存一次数据库
+                if count_since_last_save >= 200:
+                    self.wal_manager.checkpoint(self.con, force=True)
+                    count_since_last_save = 0
+                    if log_callback:
+                        log_callback(f"已下载{success_count}只，强制保存数据库")
+
+                # 定期检查点
+                if (i + 1) % config.batch_size == 0:
+                    self.wal_manager.checkpoint(self.con)
+
+                # 短暂间隔，避免服务器压力
+                time.sleep(config.request_delay)
+
+            # 最终检查点
+            self.wal_manager.checkpoint(self.con, force=True)
+
+            elapsed = time.time() - start_time
+            res['s'] = success_count
+            res['k'] = skip_count
+            res['f'] = fail_count
+
+            if log_callback:
+                log_callback(f"\n下载完成: 成功:{res['s']} 跳过:{res['k']} 失败:{res['f']} 耗时:{elapsed:.1f}秒")
+                if elapsed > 0 and res['s'] > 0:
+                    speed = res['s'] / elapsed
+                    log_callback(f"平均速度: {speed:.2f}只/秒")
+                    remaining = total - success_count - skip_count
+                    if remaining > 0:
+                        log_callback(f"预计剩余: {remaining/speed/60:.1f}分钟")
+                if fail_list:
+                    log_callback(f"失败股票数: {len(fail_list)}")
+                    for code, msg in fail_list[:10]:
+                        log_callback(f"  {code}: {msg}")
 
             if progress:
-                progress(i + 1, total, code, f"已处理 {i+1}/{total}")
-
-            # 定期检查点
-            if (i + 1) % config.batch_size == 0:
-                self.wal_manager.checkpoint(self.con)
-
-            # 短暂间隔，避免服务器压力
-            time.sleep(config.request_delay)
-
-        # 最终检查点
-        self.wal_manager.checkpoint(self.con, force=True)
-
-        elapsed = time.time() - start_time
-        res['s'] = success_count
-        res['k'] = skip_count
-        res['f'] = fail_count
-
-        if log_callback:
-            log_callback(f"\n下载完成: 成功:{res['s']} 跳过:{res['k']} 失败:{res['f']} 耗时:{elapsed:.1f}秒")
-            if elapsed > 0 and res['s'] > 0:
-                speed = res['s'] / elapsed
-                log_callback(f"平均速度: {speed:.2f}只/秒")
-                remaining = total - success_count - skip_count
-                if remaining > 0:
-                    log_callback(f"预计剩余: {remaining/speed/60:.1f}分钟")
-            if fail_list:
-                log_callback(f"失败股票数: {len(fail_list)}")
-                for code, msg in fail_list[:10]:
-                    log_callback(f"  {code}: {msg}")
-
-        if progress:
-            progress(total, total, "", f"完成 (成功:{res['s']}, 耗时:{elapsed:.1f}秒)")
+                progress(total, total, "", f"完成 (成功:{res['s']}, 耗时:{elapsed:.1f}秒)")
 
         return res
 
@@ -602,8 +846,12 @@ class StockDownloader:
 
     def close(self):
         logger.info("关闭数据库连接...")
+        self._logout()
         if hasattr(self, 'wal_manager') and self.wal_manager:
-            self.wal_manager.cleanup(self.con)
+            try:
+                self.wal_manager.cleanup(self.con)
+            except Exception as e:
+                logger.error(f"WAL清理失败: {e}")
         try:
             self.con.close()
             logger.info("数据库连接已关闭")

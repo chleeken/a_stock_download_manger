@@ -227,7 +227,20 @@ class DataConverter:
             logger.error(f"检查更新状态失败 {stock_code}: {str(e)}")
             return True, None
 
-    def convert_to_yearly(self, daily_conn, yearly_conn, stock_code, data_mapping, last_update=None):
+    def has_current_year_new_data(self, stock_code, daily_conn, data_mapping, year_start):
+        try:
+            code_col = data_mapping['code']
+            date_col = data_mapping['date']
+            result = daily_conn.execute(f"""
+                SELECT COUNT(*) FROM dayly_stock_data
+                WHERE {code_col} = '{stock_code}' AND {date_col} >= '{year_start}'
+            """).fetchone()
+            return result[0] > 0 if result else False
+        except Exception as e:
+            logger.error(f"检查年度新数据失败 {stock_code}: {str(e)}")
+            return False
+
+    def convert_to_yearly(self, daily_conn, yearly_conn, stock_code, data_mapping, last_update=None, period_start=None):
         try:
             code_col = data_mapping['code']
             date_col = data_mapping['date']
@@ -241,6 +254,8 @@ class DataConverter:
             where_clause = f"{code_col} = '{stock_code}'"
             if last_update:
                 where_clause += f" AND {date_col} > '{last_update}'"
+            if period_start:
+                where_clause += f" AND {date_col} >= '{period_start}'"
 
             query = f"""
             WITH daily_data AS (
@@ -272,6 +287,16 @@ class DataConverter:
         if not yearly_data:
             return False
         try:
+            if yearly_data:
+                year_start = yearly_data[0][0]
+                if isinstance(year_start, str):
+                    from datetime import datetime as dt
+                    year_start = dt.strptime(year_start, '%Y-%m-%d').date()
+                year_end = year_start.replace(year=year_start.year + 1)
+                yearly_conn.execute("""
+                    DELETE FROM yearly_stock_data
+                    WHERE code = ? AND date >= ? AND date < ?
+                """, [stock_code, year_start, year_end])
             yearly_conn.execute("BEGIN TRANSACTION")
             for row in yearly_data:
                 yearly_conn.execute("""
@@ -296,14 +321,15 @@ class DataConverter:
                 if not data_mapping or 'code' not in data_mapping or 'date' not in data_mapping:
                     logger.error(f"无法解析日线数据表列名，跳过股票 {stock_code}")
                     return False
+                today = self.current_time.date()
+                year_start = today.replace(month=1, day=1)
+                if not self.has_current_year_new_data(stock_code, daily_conn, data_mapping, year_start):
+                    self.skipped_count += 1
+                    self.continuous_skip += 1
+                    return False
                 with self.db_manager.yearly_connection() as yearly_conn:
                     self.init_yearly_database(yearly_conn)
-                    need_update, last_update = self.needs_update(yearly_conn, stock_code, daily_conn, data_mapping)
-                    if not need_update:
-                        self.skipped_count += 1
-                        self.continuous_skip += 1
-                        return False
-                    yearly_data = self.convert_to_yearly(daily_conn, yearly_conn, stock_code, data_mapping, last_update)
+                    yearly_data = self.convert_to_yearly(daily_conn, yearly_conn, stock_code, data_mapping, None, year_start)
                     if yearly_data is None:
                         self.skipped_count += 1
                         self.continuous_skip += 1
@@ -435,14 +461,15 @@ class DataConverter:
                 if not data_mapping or 'code' not in data_mapping or 'date' not in data_mapping:
                     logger.error(f"无法解析日线数据表列名，跳过股票 {stock_code}")
                     return None
+                today = self.current_time.date()
+                year_start = today.replace(month=1, day=1)
+                if not self.has_current_year_new_data(stock_code, daily_conn, data_mapping, year_start):
+                    self.skipped_count += 1
+                    self.continuous_skip += 1
+                    return None
                 with self.db_manager.yearly_connection() as yearly_conn:
                     self.init_yearly_database(yearly_conn)
-                    need_update, last_update = self.needs_update(yearly_conn, stock_code, daily_conn, data_mapping)
-                    if not need_update:
-                        self.skipped_count += 1
-                        self.continuous_skip += 1
-                        return None
-                    yearly_data = self.convert_to_yearly(daily_conn, yearly_conn, stock_code, data_mapping, last_update)
+                    yearly_data = self.convert_to_yearly(daily_conn, yearly_conn, stock_code, data_mapping, None, year_start)
                     if yearly_data is None:
                         self.skipped_count += 1
                         self.continuous_skip += 1

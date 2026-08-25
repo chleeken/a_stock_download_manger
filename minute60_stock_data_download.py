@@ -223,6 +223,11 @@ class StockDownloader:
                     self._login_retry = 0
                     logger.info("登录成功")
                     return True
+                elif '已经登录' in lg.error_msg or '已登录' in lg.error_msg:
+                    self._lg = True
+                    self._login_time = datetime.datetime.now()
+                    logger.info("检测到已登录会话，复用现有连接")
+                    return True
                 else:
                     logger.error(f"登录失败:{lg.error_msg}")
             except Exception as e:
@@ -782,49 +787,68 @@ class StockDownloader:
         return result, total_processed
 
     def download_stock(self, code, force=False, days=365):
-        try:
-            c = self.norm(code)
-            if not c:
-                return None, "无效代码"
-            need, reason = self.need_download_fast(c, force)
-            if not need and not force:
-                return None, reason
-            if not self._check_login():
-                self._login()
-            max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
-            now = datetime.datetime.now()
-            if force or max_date is None:
-                sd = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
-                ed = now.strftime("%Y-%m-%d")
-            else:
-                sd = (max_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                ed = now.strftime("%Y-%m-%d")
-                if sd > ed:
-                    return None, "已是最新"
-            rs = bs.query_history_k_data_plus(
-                self._full_code(c), "date,time,open,high,low,close,volume,amount",
-                start_date=sd, end_date=ed, frequency="60", adjustflag="2"
-            )
-            if rs.error_code != '0':
-                logger.error(f"{c} 下载失败:{rs.error_msg}")
-                return None, rs.error_msg
-            data_rows = []
-            fields = rs.fields
-            while rs.next():
-                data_rows.append(rs.get_row_data())
-            if not data_rows:
-                return None, "无新数据"
-            processed_data = self.process_stock_data_batch(data_rows, fields, c, max_date if not force else None)
-            if not processed_data:
-                return None, "处理后无新数据"
-            filtered_data = self.filter_time_points_batch(processed_data)
-            if filtered_data:
-                return filtered_data, "成功"
-            else:
-                return None, "无有效数据"
-        except Exception as e:
-            logger.error(f"{code} 处理异常:{str(e)}")
-            return None, str(e)
+        max_retries = config.retry_times
+        for attempt in range(max_retries):
+            try:
+                c = self.norm(code)
+                if not c:
+                    return None, "无效代码"
+                need, reason = self.need_download_fast(c, force)
+                if not need and not force:
+                    return None, reason
+                if not self._check_login():
+                    self._login()
+                max_date = self._stock_cache.get(c, {}).get('max_date') if not force else None
+                now = datetime.datetime.now()
+                if force or max_date is None:
+                    sd = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+                    ed = now.strftime("%Y-%m-%d")
+                else:
+                    sd = (max_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    ed = now.strftime("%Y-%m-%d")
+                    if sd > ed:
+                        return None, "已是最新"
+                rs = bs.query_history_k_data_plus(
+                    self._full_code(c), "date,time,open,high,low,close,volume,amount",
+                    start_date=sd, end_date=ed, frequency="60", adjustflag="2"
+                )
+                if rs.error_code != '0':
+                    is_network_error = any(k in rs.error_msg for k in ['网络', '连接', 'socket', '超时', '10060', '10053', '10054', '10061', '10038', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
+                    if is_network_error and attempt < max_retries - 1:
+                        wait = min(2 ** attempt, 10)
+                        msg = f"{c} 网络错误({rs.error_msg[:30]}...)，{wait}秒后重试 ({attempt+1}/{max_retries})"
+                        logger.warning(msg)
+                        time.sleep(wait)
+                        continue
+                    logger.error(f"{c} 下载失败:{rs.error_msg}")
+                    return None, rs.error_msg
+                data_rows = []
+                fields = rs.fields
+                while rs.next():
+                    data_rows.append(rs.get_row_data())
+                if not data_rows:
+                    return None, "无新数据"
+                processed_data = self.process_stock_data_batch(data_rows, fields, c, max_date if not force else None)
+                if not processed_data:
+                    return None, "处理后无新数据"
+                filtered_data = self.filter_time_points_batch(processed_data)
+                if filtered_data:
+                    return filtered_data, "成功"
+                else:
+                    return None, "无有效数据"
+            except Exception as e:
+                err_str = str(e)
+                is_network = any(k in err_str for k in ['网络', '连接', 'socket', '超时', '10060', '10053', '10054', '10061', '10038', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
+                if is_network and attempt < max_retries - 1:
+                    wait = min(2 ** attempt, 10)
+                    logger.warning(f"{c} 网络异常，{wait}秒后重试 ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                logger.error(f"{c} 处理异常:{str(e)}")
+                import baostock as bs
+                bs.login()
+                return None, str(e)
+        return None, "重试次数已达上限"
 
     def download_optimized(self, stocks=None, force=False, progress=None, log_callback=None):
         if stocks is None:

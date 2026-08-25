@@ -98,7 +98,7 @@ class DataConverter:
         self.skipped_count = 0
         self.processed_count = 0
         self.continuous_skip = 0
-        self.start_time = None
+        self.start_time = time.time()
         self.current_time = datetime.now()
 
     def has_current_quarter_data(self, seasonly_db_path):
@@ -235,7 +235,20 @@ class DataConverter:
             logger.error(f"检查更新状态失败 {stock_code}: {str(e)}")
             return True, None
 
-    def convert_to_quarterly(self, daily_conn, seasonly_conn, stock_code, data_mapping, last_update=None):
+    def has_current_quarter_new_data(self, stock_code, daily_conn, data_mapping, quarter_start):
+        try:
+            code_col = data_mapping['code']
+            date_col = data_mapping['date']
+            result = daily_conn.execute(f"""
+                SELECT COUNT(*) FROM dayly_stock_data
+                WHERE {code_col} = '{stock_code}' AND {date_col} >= '{quarter_start}'
+            """).fetchone()
+            return result[0] > 0 if result else False
+        except Exception as e:
+            logger.error(f"检查季度新数据失败 {stock_code}: {str(e)}")
+            return False
+
+    def convert_to_quarterly(self, daily_conn, seasonly_conn, stock_code, data_mapping, last_update=None, period_start=None):
         try:
             code_col = data_mapping['code']
             date_col = data_mapping['date']
@@ -249,6 +262,8 @@ class DataConverter:
             where_clause = f"{code_col} = '{stock_code}'"
             if last_update:
                 where_clause += f" AND {date_col} > '{last_update}'"
+            if period_start:
+                where_clause += f" AND {date_col} >= '{period_start}'"
 
             query = f"""
             WITH daily_data AS (
@@ -280,6 +295,16 @@ class DataConverter:
         if not quarterly_data:
             return False
         try:
+            if quarterly_data:
+                quarter_start = quarterly_data[0][0]
+                if isinstance(quarter_start, str):
+                    from datetime import datetime as dt
+                    quarter_start = dt.strptime(quarter_start, '%Y-%m-%d').date()
+                quarter_end = quarter_start.replace(month=quarter_start.month + 3) if quarter_start.month <= 9 else quarter_start.replace(year=quarter_start.year + 1, month=quarter_start.month - 9)
+                seasonly_conn.execute("""
+                    DELETE FROM seasonly_stock_data
+                    WHERE code = ? AND date >= ? AND date < ?
+                """, [stock_code, quarter_start, quarter_end])
             seasonly_conn.execute("BEGIN TRANSACTION")
             for row in quarterly_data:
                 seasonly_conn.execute("""
@@ -304,14 +329,23 @@ class DataConverter:
                 if not data_mapping or 'code' not in data_mapping or 'date' not in data_mapping:
                     logger.error(f"无法解析日线数据表列名，跳过股票 {stock_code}")
                     return False
+                today = self.current_time.date()
+                month = today.month
+                if month <= 3:
+                    q_start = today.replace(month=1, day=1)
+                elif month <= 6:
+                    q_start = today.replace(month=4, day=1)
+                elif month <= 9:
+                    q_start = today.replace(month=7, day=1)
+                else:
+                    q_start = today.replace(month=10, day=1)
+                if not self.has_current_quarter_new_data(stock_code, daily_conn, data_mapping, q_start):
+                    self.skipped_count += 1
+                    self.continuous_skip += 1
+                    return False
                 with self.db_manager.seasonly_connection() as seasonly_conn:
                     self.init_seasonly_database(seasonly_conn)
-                    need_update, last_update = self.needs_update(seasonly_conn, stock_code, daily_conn, data_mapping)
-                    if not need_update:
-                        self.skipped_count += 1
-                        self.continuous_skip += 1
-                        return False
-                    quarterly_data = self.convert_to_quarterly(daily_conn, seasonly_conn, stock_code, data_mapping, last_update)
+                    quarterly_data = self.convert_to_quarterly(daily_conn, seasonly_conn, stock_code, data_mapping, None, q_start)
                     if quarterly_data is None:
                         self.skipped_count += 1
                         self.continuous_skip += 1
@@ -334,7 +368,7 @@ class DataConverter:
         self.skipped_count = 0
         self.processed_count = 0
         self.continuous_skip = 0
-        self.start_time = None
+        self.start_time = time.time()
 
         try:
             with self.db_manager.daily_connection() as daily_conn:
@@ -443,14 +477,23 @@ class DataConverter:
                 if not data_mapping or 'code' not in data_mapping or 'date' not in data_mapping:
                     logger.error(f"无法解析日线数据表列名，跳过股票 {stock_code}")
                     return None
+                today = self.current_time.date()
+                month = today.month
+                if month <= 3:
+                    q_start = today.replace(month=1, day=1)
+                elif month <= 6:
+                    q_start = today.replace(month=4, day=1)
+                elif month <= 9:
+                    q_start = today.replace(month=7, day=1)
+                else:
+                    q_start = today.replace(month=10, day=1)
+                if not self.has_current_quarter_new_data(stock_code, daily_conn, data_mapping, q_start):
+                    self.skipped_count += 1
+                    self.continuous_skip += 1
+                    return None
                 with self.db_manager.seasonly_connection() as seasonly_conn:
                     self.init_seasonly_database(seasonly_conn)
-                    need_update, last_update = self.needs_update(seasonly_conn, stock_code, daily_conn, data_mapping)
-                    if not need_update:
-                        self.skipped_count += 1
-                        self.continuous_skip += 1
-                        return None
-                    quarterly_data = self.convert_to_quarterly(daily_conn, seasonly_conn, stock_code, data_mapping, last_update)
+                    quarterly_data = self.convert_to_quarterly(daily_conn, seasonly_conn, stock_code, data_mapping, None, q_start)
                     if quarterly_data is None:
                         self.skipped_count += 1
                         self.continuous_skip += 1

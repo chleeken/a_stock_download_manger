@@ -164,34 +164,73 @@ class DatabaseManager:
             logger.error(f"获取股票{code}日线数据失败: {e}")
             return []
 
-    def get_last_monthly_date(self, code: str) -> Optional[date]:
+    def get_stock_monthly_max_date(self, code: str) -> Optional[date]:
         if not self.monthly_conn:
             return None
         try:
-            result = self.monthly_conn.execute("""
-                SELECT last_download_date FROM monthly_last_download_time WHERE code = ?
-            """, [code]).fetchone()
-            if result and result[0]:
-                return result[0]
             result = self.monthly_conn.execute("""
                 SELECT MAX(date) FROM monthly_data WHERE code = ?
             """, [code]).fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
-            logger.error(f"获取股票{code}最后月线日期失败: {e}")
+            logger.error(f"获取股票{code}月线最大日期失败: {e}")
             return None
+
+    def has_new_daily_in_period(self, code: str, period_start: date) -> bool:
+        if not self.daily_conn:
+            return False
+        try:
+            columns = self.get_daily_table_columns()
+            code_col = self.detect_column_name(self.code_column_names, columns)
+            date_col = self.detect_column_name(self.date_column_names, columns)
+            if not code_col or not date_col:
+                return False
+            result = self.daily_conn.execute(f"""
+                SELECT COUNT(*) FROM {Config.DAILY_TABLE}
+                WHERE {code_col} = ? AND {date_col} >= ?
+            """, [code, period_start]).fetchone()
+            return result[0] > 0
+        except Exception as e:
+            logger.error(f"检查股票{code}周期内新日线数据失败: {e}")
+            return False
+
+    def needs_monthly_update(self, code: str) -> bool:
+        if not self.daily_conn or not self.monthly_conn:
+            return False
+        try:
+            monthly_max = self.get_stock_monthly_max_date(code)
+            columns = self.get_daily_table_columns()
+            code_col = self.detect_column_name(self.code_column_names, columns)
+            date_col = self.detect_column_name(self.date_column_names, columns)
+            if not code_col or not date_col:
+                return False
+            result = self.daily_conn.execute(f"""
+                SELECT MAX({date_col}) FROM {Config.DAILY_TABLE}
+                WHERE {code_col} = ?
+            """, [code]).fetchone()
+            daily_max = result[0] if result else None
+            if not daily_max:
+                return False
+            if not monthly_max:
+                return True
+            # 比较年-月粒度：将日线日期截断到月初
+            daily_month_start = daily_max.replace(day=1)
+            monthly_month_start = monthly_max.replace(day=1)
+            return daily_month_start > monthly_month_start
+        except Exception as e:
+            logger.error(f"检查股票{code}是否需要月线更新失败: {e}")
+            return False
 
     def save_monthly_data(self, code: str, monthly_data: List[Dict], is_temporary: bool = False):
         if not self.monthly_conn or not monthly_data:
             return False
         try:
+            current_month = monthly_data[0]['date'].replace(day=1)
+            next_month = (current_month + timedelta(days=32)).replace(day=1)
             self.monthly_conn.execute("BEGIN TRANSACTION")
-            if is_temporary:
-                current_month = monthly_data[0]['date'].replace(day=1)
-                next_month = (current_month + timedelta(days=32)).replace(day=1)
-                self.monthly_conn.execute("""
-                    DELETE FROM monthly_data WHERE code = ? AND date >= ? AND date < ?
-                """, [code, current_month, next_month])
+            self.monthly_conn.execute("""
+                DELETE FROM monthly_data WHERE code = ? AND date >= ? AND date < ?
+            """, [code, current_month, next_month])
             for data in monthly_data:
                 self.monthly_conn.execute("""
                     INSERT OR REPLACE INTO monthly_data (code, date, open, high, low, close, volume, amount)
@@ -227,8 +266,8 @@ class DatabaseManager:
             logger.error(f"批量更新索引失败: {e}")
             return False
 
-    def convert_daily_to_monthly_sql(self, code: str) -> List[Dict]:
-        """使用SQL聚合将日线转为月线"""
+    def convert_daily_to_monthly_sql(self, code: str, period_start: date) -> List[Dict]:
+        """使用SQL聚合将日线转为月线，只聚合指定日期之后的数据"""
         if not self.daily_conn or not self.monthly_conn:
             return []
         try:
@@ -248,11 +287,11 @@ class DatabaseManager:
                        SUM(volume) as volume,
                        SUM(amount) as amount
                 FROM {Config.DAILY_TABLE}
-                WHERE {code_col} = ?
+                WHERE {code_col} = ? AND {date_col} >= ?
                 GROUP BY {code_col}, DATE_TRUNC('month', {date_col})
                 ORDER BY month_start
             """
-            result = self.daily_conn.execute(query, [code]).fetchall()
+            result = self.daily_conn.execute(query, [code, period_start]).fetchall()
             data = []
             for row in result:
                 data.append({
@@ -282,53 +321,18 @@ class DataProcessor:
         self.pause_flag = False
         self.current_time = datetime.now()
 
-    def needs_monthly_update(self, code: str) -> Tuple[bool, Optional[date]]:
-        """检查是否需要更新月线数据，返回 (need_update, start_date)"""
-        try:
-            if not self.db.monthly_conn:
-                return True, None
-            last_date = self.db.get_last_monthly_date(code)
-            if not last_date:
-                return True, None
-            daily_data = self.db.get_stock_daily_data(code)
-            if not daily_data:
-                return False, None
-            latest_daily = daily_data[-1]['date']
-            if latest_daily > last_date:
-                return True, last_date
-            return False, None
-        except Exception as e:
-            logger.error(f"判断股票{code}月线更新状态失败: {e}")
-            return True, None
-
-    def should_process_stock(self, code: str, skip_optimization: bool) -> Tuple[bool, Optional[date]]:
-        try:
-            if not skip_optimization:
-                return True, None
-            need_update, start_date = self.needs_monthly_update(code)
-            if need_update:
-                self.stats['consecutive_skips'] = 0
-                return True, start_date
-            else:
-                self.stats['consecutive_skips'] += 1
-                return False, None
-        except Exception as e:
-            logger.error(f"判断股票{code}处理状态失败: {e}")
-            return True, None
-
     def check_auto_skip(self) -> bool:
-        return self.stats['consecutive_skips'] >= Config.AUTO_SKIP_THRESHOLD
+        return False
 
     def process_stock(self, code: str, start_date: Optional[date] = None,
                       skip_optimization: bool = True) -> Tuple[bool, int]:
         try:
-            monthly_data = self.db.convert_daily_to_monthly_sql(code)
+            if not self.db.needs_monthly_update(code):
+                return True, 0
+            monthly_data = self.db.convert_daily_to_monthly_sql(code, start_date or date(1990, 1, 1))
             if not monthly_data:
                 return True, 0
-            today = date.today()
-            current_month = today.replace(day=1)
-            is_temporary = any(d['date'] >= current_month for d in monthly_data)
-            success = self.db.save_monthly_data(code, monthly_data, is_temporary)
+            success = self.db.save_monthly_data(code, monthly_data, is_temporary=False)
             if success:
                 return True, len(monthly_data)
             else:
@@ -358,32 +362,27 @@ class DataProcessor:
                 if self.stop_flag:
                     break
 
-            if skip_optimization and self.check_auto_skip():
-                msg = f"连续{Config.AUTO_SKIP_THRESHOLD}只股票无新数据，自动跳过"
-                if log_callback:
-                    log_callback(msg)
-                self.stats['skipped'] += (len(stock_codes) - i)
-                break
-
-            should_process, start_date = self.should_process_stock(code, skip_optimization)
-            if should_process:
-                if progress_callback:
-                    progress_callback(code, i, len(stock_codes))
-                success, count = self.process_stock(code, start_date, skip_optimization)
-                if success:
-                    if count > 0:
-                        self.stats['processed'] += 1
-                        if log_callback:
-                            log_callback(f"\u2713 {code}: 转换成功，生成{count}条月线记录")
-                        batch_updates.append((code, date.today()))
-                    else:
-                        self.stats['skipped'] += 1
-                else:
-                    self.stats['failed'] += 1
-                    if log_callback:
-                        log_callback(f"\u2717 {code}: 转换失败")
-            else:
+            if not self.db.needs_monthly_update(code):
+                self.stats['consecutive_skips'] += 1
                 self.stats['skipped'] += 1
+                continue
+
+            self.stats['consecutive_skips'] = 0
+            if progress_callback:
+                progress_callback(code, i, len(stock_codes))
+            success, count = self.process_stock(code, skip_optimization=False)
+            if success:
+                if count > 0:
+                    self.stats['processed'] += 1
+                    if log_callback:
+                        log_callback(f"✓ {code}: 转换成功，生成{count}条月线记录")
+                    batch_updates.append((code, date.today()))
+                else:
+                    self.stats['skipped'] += 1
+            else:
+                self.stats['failed'] += 1
+                if log_callback:
+                    log_callback(f"✗ {code}: 转换失败")
 
             if len(batch_updates) >= 100:
                 self.db.batch_update_index(batch_updates)
