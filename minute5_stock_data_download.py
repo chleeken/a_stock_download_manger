@@ -111,8 +111,22 @@ def _ensure_baostock_login():
         elif '已经登录' in lg.error_msg or '已登录' in lg.error_msg:
             _bs_logged_in = True
 
+def _is_socket_error(err_str):
+    """判断是否为 socket 层错误（需要强制重置连接）"""
+    return any(k in err_str for k in ['10057', '10061', '10053', '10054', '10060'])
+
+def _is_network_error(err_str):
+    """判断是否为网络/数据损坏错误（可重试）"""
+    return any(k in err_str for k in [
+        '10060', '10053', '10054', '10061', '10057',
+        'socket', '连接', '网络', '超时',
+        'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated', 'incomplete',
+        '连接失败', '接收数据异常', '发送数据异常', '套接字', 'connection', 'refused', '服务器连接失败'
+    ])
+
 def _download_single(code, max_date, force, timeout, retry_times):
     """下载单只股票数据（线程安全版本）"""
+    global _bs_logged_in
     c = ''.join(filter(str.isdigit, str(code)))
     c = c.zfill(6) if len(c) == 6 else ""
     if not c:
@@ -140,9 +154,10 @@ def _download_single(code, max_date, force, timeout, retry_times):
             )
 
             if rs.error_code != '0':
-                is_network_error = any(k in rs.error_msg for k in ['网络', '连接', 'socket', '超时', '10060', '10054', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
-                if is_network_error and attempt < retry_times - 1:
-                    time.sleep(0.5)
+                is_net = _is_network_error(rs.error_msg)
+                if is_net and attempt < retry_times - 1:
+                    time.sleep(1.0)
+                    _bs_logged_in = False
                     _ensure_baostock_login()
                     continue
                 if attempt < retry_times - 1:
@@ -152,14 +167,28 @@ def _download_single(code, max_date, force, timeout, retry_times):
 
             data_rows = []
             fields = None
-            while rs.next():
-                try:
-                    row_data = rs.get_row_data()
-                    data_rows.append(row_data)
-                    if fields is None:
-                        fields = rs.fields
-                except Exception:
+            try:
+                while rs.next():
+                    try:
+                        row_data = rs.get_row_data()
+                        data_rows.append(row_data)
+                        if fields is None:
+                            fields = rs.fields
+                    except Exception as inner_e:
+                        inner_str = str(inner_e)
+                        if any(k in inner_str for k in ['decompressing', 'codec', 'utf-8', 'binary', 'truncated', 'incomplete']):
+                            raise
+                        continue
+            except Exception as e:
+                err_str = str(e)
+                is_net = _is_network_error(err_str)
+                if is_net and attempt < retry_times - 1:
+                    wait = 1.0 if _is_socket_error(err_str) else 0.5
+                    time.sleep(wait)
+                    _bs_logged_in = False
+                    _ensure_baostock_login()
                     continue
+                return None, err_str, None
 
             if not data_rows:
                 return None, "无新数据", None
@@ -168,13 +197,10 @@ def _download_single(code, max_date, force, timeout, retry_times):
 
         except Exception as e:
             err_str = str(e)
-            is_network = any(k in err_str for k in ['10060', '10053', '10054', '10061', 'socket', '连接', '网络', '超时', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
-            if is_network and attempt < retry_times - 1:
-                time.sleep(0.5)
-                _ensure_baostock_login()
-                continue
-            if attempt < retry_times - 1:
-                time.sleep(0.5)
+            if _is_network_error(err_str) and attempt < retry_times - 1:
+                wait = 1.0 if _is_socket_error(err_str) else 0.5
+                time.sleep(wait)
+                _bs_logged_in = False
                 _ensure_baostock_login()
                 continue
             return None, str(e), None
