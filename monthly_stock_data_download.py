@@ -209,6 +209,8 @@ class DatabaseManager:
                 WHERE {code_col} = ?
             """, [code]).fetchone()
             daily_max = result[0] if result else None
+            if isinstance(daily_max, datetime):
+                daily_max = daily_max.date()
             if not daily_max:
                 return False
             if not monthly_max:
@@ -294,9 +296,13 @@ class DatabaseManager:
             result = self.daily_conn.execute(query, [code, period_start]).fetchall()
             data = []
             for row in result:
+                # 日线 date 列可能是 TIMESTAMP，统一转为 DATE 保证月线库一致性
+                d = row[1]
+                if isinstance(d, datetime):
+                    d = d.date()
                 data.append({
                     'code': row[0],
-                    'date': row[1],
+                    'date': d,
                     'open': float(row[2]) if row[2] else 0.0,
                     'high': float(row[3]) if row[3] else 0.0,
                     'low': float(row[4]) if row[4] else 0.0,
@@ -329,7 +335,16 @@ class DataProcessor:
         try:
             if not self.db.needs_monthly_update(code):
                 return True, 0
-            monthly_data = self.db.convert_daily_to_monthly_sql(code, start_date or date(1990, 1, 1))
+            # 增量转换：基于月线已有最大日期确定日线聚合起点。
+            # 月线最大日期若为 2 月末，则需从 1 月 1 日重算整个 1 月；
+            # 若为 2 月中旬，则当月未完整，从当月 1 日重算即可。
+            if start_date is None:
+                monthly_max = self.db.get_stock_monthly_max_date(code)
+                if monthly_max is None:
+                    start_date = date(1990, 1, 1)
+                else:
+                    start_date = date(monthly_max.year, monthly_max.month, 1)
+            monthly_data = self.db.convert_daily_to_monthly_sql(code, start_date)
             if not monthly_data:
                 return True, 0
             success = self.db.save_monthly_data(code, monthly_data, is_temporary=False)
