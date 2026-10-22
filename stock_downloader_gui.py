@@ -53,13 +53,15 @@ class StockDownloaderGUI(StockDownloaderCore):
             '5min': os.path.join(data_dir, "minute5_stock_data.duckdb"),
         }
 
-        # 文件路径（全部在程序目录下）
+        # 文件路径
         file_paths = {
-            'table_txt': os.path.join(data_dir, "table.txt"),
+            # 股票列表与上市日期CSV：放在程序目录下
+            'table_txt': os.path.join(program_dir, "table.txt"),
+            'info_db': os.path.join(program_dir, "Table.csv"),
+            # 其他数据文件仍在数据目录
             'failed_txt': os.path.join(data_dir, "failed_stocks.txt"),
             'config': os.path.join(data_dir, "stock_get_date_config.json"),
             'downloaded_record': os.path.join(data_dir, "downloaded_stocks.json"),
-            'info_db': os.path.join(data_dir, "Table.csv"),
             'zixuan_csv': os.path.join(data_dir, "zixuan.csv"),
             'zixuangu_csv': os.path.join(data_dir, "zixuangu.csv"),
         }

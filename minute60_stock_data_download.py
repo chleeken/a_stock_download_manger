@@ -343,7 +343,7 @@ class StockDownloader:
             return False, str(e)
 
     def read_file(self, f=None):
-        base_dir = Path(__file__).parent.parent / "stock_data"
+        base_dir = Path(__file__).parent
         p = Path(f or (base_dir / config.stock_file))
         if not p.exists():
             logger.error(f"文件不存在:{p}")
