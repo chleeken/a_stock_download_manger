@@ -127,6 +127,11 @@ class StockDownloaderCore:
         self.retry_delay = 5
         self.stock_retry_count = {}
 
+        # 登录重试
+        self.last_login_time = 0
+        self.login_retry_count = 3
+        self.login_retry_delay = 10
+
         # 缺失股票记录
         self.missing_stocks = set()
 
@@ -1171,27 +1176,40 @@ class StockDownloaderCore:
         self.last_request_time = time.time()
 
     def ensure_login(self):
+        """登录baostock，失败后自动重试（最多 login_retry_count 次）"""
         current_time = time.time()
-        if not self.bs_logged_in or (current_time - self.last_login_time) > 1800:
+        if self.bs_logged_in and (current_time - self.last_login_time) <= 1800:
+            return True
+
+        if self.bs_logged_in:
             try:
-                if self.bs_logged_in:
-                    try:
-                        bs.logout()
-                    except Exception:
-                        pass
-                    self.bs_logged_in = False
-                self._log("正在登录baostock...")
+                bs.logout()
+            except Exception:
+                pass
+            self.bs_logged_in = False
+
+        for attempt in range(1, self.login_retry_count + 1):
+            try:
+                if attempt > 1:
+                    self._log(f"第 {attempt}/{self.login_retry_count} 次重试登录baostock...")
+                else:
+                    self._log("正在登录baostock...")
                 lg = bs.login()
                 if lg.error_code != '0':
                     raise Exception(f"登录失败: {lg.error_msg}")
                 self.bs_logged_in = True
                 self.bs_session = lg
-                self.last_login_time = current_time
+                self.last_login_time = time.time()
                 self._log("baostock登录成功")
+                return True
             except Exception as e:
                 self._log(f"登录失败: {e}", "ERROR")
-                return False
-        return True
+                if attempt < self.login_retry_count:
+                    wait_time = self.login_retry_delay * attempt
+                    self._log(f"{wait_time}秒后重试登录...")
+                    time.sleep(wait_time)
+        self._log(f"登录失败，已重试 {self.login_retry_count} 次，放弃登录", "ERROR")
+        return False
 
     def check_and_relogin(self, error_msg: str) -> bool:
         error_msg_lower = error_msg.lower()
