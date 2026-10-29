@@ -1212,11 +1212,19 @@ class StockDownloaderCore:
         return False
 
     def check_and_relogin(self, error_msg: str) -> bool:
+        """检测错误消息，如果是登录/网络/连接类错误则重新登录baostock"""
         error_msg_lower = error_msg.lower()
+        # 登录相关错误
         login_errors = ['登录', 'login', 'auth', '认证', 'session', '未登录', 'token', 'expired', '过期', '无效', 'invalid']
-        for keyword in login_errors:
+        # 网络/连接相关错误（socket错误、连接超时、无法连接远程主机等）
+        network_errors = [
+            '网络', '连接', 'timeout', '超时', 'socket', 'connection',
+            'refused', 'reset', '断开', '断开连接',
+            '10053', '10054', '10057', '10060', '10061', '10065',
+        ]
+        for keyword in login_errors + network_errors:
             if keyword in error_msg_lower:
-                self._log(f"检测到登录相关错误，尝试重新登录: {error_msg}", "WARNING")
+                self._log(f"检测到{keyword}相关错误，尝试重新登录baostock: {error_msg[:80]}", "WARNING")
                 self.bs_logged_in = False
                 return self.ensure_login()
         return True

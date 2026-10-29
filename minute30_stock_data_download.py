@@ -623,9 +623,11 @@ class StockDownloader:
                     is_network_error = any(k in rs.error_msg for k in ['网络', '连接', 'socket', '超时', '10060', '10053', '10054', '10061', '10038', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
                     if is_network_error and attempt < max_retries - 1:
                         wait = min(2 ** attempt, 10)
-                        msg = f"{c} 网络错误({rs.error_msg[:30]}...)，{wait}秒后重试 ({attempt+1}/{max_retries})"
+                        msg = f"{c} 网络错误({rs.error_msg[:30]}...)，{wait}秒后重试并重新登录 ({attempt+1}/{max_retries})"
                         logger.warning(msg)
                         time.sleep(wait)
+                        self._logout()
+                        self._login()
                         continue
                     logger.error(f"{c} 下载失败:{rs.error_msg}")
                     return None, rs.error_msg
@@ -658,11 +660,14 @@ class StockDownloader:
                 is_network = any(k in err_str for k in ['10060', '10053', '10054', '10061', '10038', 'socket', '连接', '网络', '超时', 'decompressing', 'codec', 'utf-8', 'encode', 'decode', 'binary', 'truncated'])
                 if is_network and attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    logger.warning(f"{code} 网络异常，{wait}秒后重试 ({attempt+1}/{max_retries})")
+                    logger.warning(f"{code} 网络异常，{wait}秒后重试并重新登录 ({attempt+1}/{max_retries})")
                     time.sleep(wait)
+                    self._logout()
+                    self._login()
                     continue
                 logger.error(f"{code} 处理异常:{str(e)}")
-                _ensure_baostock_login()
+                self._logout()
+                self._login()
                 return None, str(e)
         return None, "重试次数已达上限"
 
